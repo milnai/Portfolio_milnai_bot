@@ -52,8 +52,11 @@ def get_portfolio_data():
         
         for ticker, info in HOLDINGS.items():
             try:
-                data = yf.download(ticker, period="1d", progress=False)
-                if data.empty:
+                logger.info(f"Fetching {ticker}...")
+                data = yf.download(ticker, period="1d", progress=False, timeout=10)
+                
+                if data is None or data.empty:
+                    logger.warning(f"No data for {ticker}")
                     continue
                 
                 current_price = float(data['Close'].iloc[-1])
@@ -73,12 +76,16 @@ def get_portfolio_data():
                     "pnl": pnl,
                     "pnl_pct": pnl_pct,
                 }
+                logger.info(f"✅ Got {ticker}: ${current_price:.2f}")
+                
             except Exception as e:
                 logger.error(f"Error fetching {ticker}: {e}")
                 continue
         
         total_pnl = total_value - total_cost
         total_pnl_pct = (total_pnl / total_cost * 100) if total_cost > 0 else 0
+        
+        logger.info(f"Portfolio positions: {len(positions)}")
         
         return {
             "positions": positions,
@@ -88,7 +95,7 @@ def get_portfolio_data():
         }
     except Exception as e:
         logger.error(f"Error in get_portfolio_data: {e}")
-        return None
+        return {"positions": {}, "total_value": 0, "total_pnl": 0, "total_pnl_pct": 0}
 
 
 def get_market_metrics():
@@ -98,8 +105,11 @@ def get_market_metrics():
         
         for ticker in MARKET_TICKERS:
             try:
-                data = yf.download(ticker, period="5d", progress=False)
-                if data.empty:
+                logger.info(f"Fetching {ticker}...")
+                data = yf.download(ticker, period="5d", progress=False, timeout=10)
+                
+                if data is None or data.empty:
+                    logger.warning(f"No data for {ticker}")
                     continue
                 
                 close = data['Close']
@@ -111,14 +121,17 @@ def get_market_metrics():
                     "price": current,
                     "change_pct": change_pct,
                 }
+                logger.info(f"✅ Got {ticker}: ${current:.2f}")
+                
             except Exception as e:
                 logger.error(f"Error fetching {ticker}: {e}")
                 continue
         
+        logger.info(f"Market metrics: {len(metrics)} tickers")
         return metrics
     except Exception as e:
         logger.error(f"Error in get_market_metrics: {e}")
-        return None
+        return {}
 
 
 # ============================================================================
@@ -134,15 +147,17 @@ def format_message(portfolio, metrics):
         
         # Market metrics
         msg += "📊 **MARKET METRICS**\n"
-        if metrics:
+        if metrics and len(metrics) > 0:
             for ticker, data in metrics.items():
                 emoji = "📈" if data["change_pct"] >= 0 else "📉"
                 msg += f"{emoji} {ticker}: ${data['price']:.2f} ({data['change_pct']:+.2f}%)\n"
+        else:
+            msg += "_(No market data)_\n"
         msg += "\n"
         
         # Portfolio
         msg += "💼 **PORTFOLIO**\n"
-        if portfolio and portfolio.get("positions"):
+        if portfolio and len(portfolio.get("positions", {})) > 0:
             for ticker, pos in portfolio["positions"].items():
                 emoji = "🟢" if pos["pnl"] >= 0 else "🔴"
                 msg += f"{emoji} {ticker}: ${pos['price']:.2f} ({pos['pnl_pct']:+.2f}%)\n"
@@ -151,6 +166,8 @@ def format_message(portfolio, metrics):
             total_emoji = "🟢" if portfolio["total_pnl"] >= 0 else "🔴"
             msg += f"{total_emoji} **TOTAL P&L**: ${portfolio['total_pnl']:+.2f} "
             msg += f"({portfolio['total_pnl_pct']:+.2f}%)\n"
+        else:
+            msg += "_(No portfolio data)_\n"
         
         return msg
     except Exception as e:
@@ -197,7 +214,7 @@ async def main():
         # Add hourly report job
         scheduler.add_job(
             send_hourly_report,
-            CronTrigger(minute="*/1"),  # Every hour at :00
+            CronTrigger(minute=0),  # Every hour at :00
             id="hourly_report",
             name="Hourly Market Report"
         )
