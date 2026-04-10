@@ -187,12 +187,15 @@ async def send_hourly_report():
         
         logger.info("📊 Fetching portfolio data...")
         portfolio = get_portfolio_data()
+        logger.info(f"Portfolio returned: {portfolio}")
         
         logger.info("📈 Fetching market metrics...")
         metrics = get_market_metrics()
+        logger.info(f"Metrics returned: {metrics}")
         
         logger.info("📝 Formatting message...")
         message = format_message(portfolio, metrics)
+        logger.info(f"Message length: {len(message)} chars")
         
         logger.info(f"📤 Sending to {chat_id}...")
         await bot.send_message(chat_id=chat_id, text=message, parse_mode="Markdown")
@@ -200,6 +203,8 @@ async def send_hourly_report():
         
     except Exception as e:
         logger.error(f"❌ Failed to send report: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
 
 
 # ============================================================================
