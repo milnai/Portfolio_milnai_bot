@@ -4,15 +4,19 @@ Simplified Telegram Market Bot - Hourly Stock & Market Updates
 No complex indicator calculations - just portfolio + market metrics
 """
 
+import asyncio
 import os
 import logging
 from datetime import datetime
-import asyncio
 
 import yfinance as yf
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from telegram import Bot
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
 
 
 # ============================================================================
@@ -52,14 +56,14 @@ def get_portfolio_data():
         
         for ticker, info in HOLDINGS.items():
             try:
-                logger.info(f"Fetching {ticker}...")
+                logger.info(f"📊 Fetching {ticker}...")
                 data = yf.download(ticker, period="1d", progress=False, timeout=10)
                 
                 if data is None or data.empty:
-                    logger.warning(f"No data for {ticker}")
+                    logger.warning(f"⚠️ No data for {ticker}")
                     continue
                 
-                current_price = float(data['Close'].iloc[-1])
+                current_price = float(data['Close'].values[-1].item())
                 shares = info["shares"]
                 avg_cost = info["avg_cost"]
                 
@@ -76,16 +80,16 @@ def get_portfolio_data():
                     "pnl": pnl,
                     "pnl_pct": pnl_pct,
                 }
-                logger.info(f"✅ Got {ticker}: ${current_price:.2f}")
+                logger.info(f"✅ {ticker}: ${current_price:.2f} | PnL: ${pnl:.2f} ({pnl_pct:.2f}%)")
                 
             except Exception as e:
-                logger.error(f"Error fetching {ticker}: {e}")
+                logger.error(f"❌ Error fetching {ticker}: {str(e)[:100]}")
                 continue
         
         total_pnl = total_value - total_cost
         total_pnl_pct = (total_pnl / total_cost * 100) if total_cost > 0 else 0
         
-        logger.info(f"Portfolio positions: {len(positions)}")
+        logger.info(f"📈 Portfolio complete: {len(positions)} positions fetched | Total value: ${total_value:.2f}")
         
         return {
             "positions": positions,
@@ -94,7 +98,7 @@ def get_portfolio_data():
             "total_pnl_pct": total_pnl_pct,
         }
     except Exception as e:
-        logger.error(f"Error in get_portfolio_data: {e}")
+        logger.error(f"💥 Error in get_portfolio_data: {str(e)[:100]}")
         return {"positions": {}, "total_value": 0, "total_pnl": 0, "total_pnl_pct": 0}
 
 
@@ -105,32 +109,32 @@ def get_market_metrics():
         
         for ticker in MARKET_TICKERS:
             try:
-                logger.info(f"Fetching {ticker}...")
+                logger.info(f"📊 Fetching market ticker {ticker}...")
                 data = yf.download(ticker, period="5d", progress=False, timeout=10)
                 
                 if data is None or data.empty:
-                    logger.warning(f"No data for {ticker}")
+                    logger.warning(f"⚠️ No data for {ticker}")
                     continue
                 
                 close = data['Close']
-                current = float(close.iloc[-1])
-                prev_close = float(close.iloc[-2])
+                current = float(close.values[-1].item())
+                prev_close = float(close.values[-2].item())
                 change_pct = ((current - prev_close) / prev_close * 100) if prev_close > 0 else 0
                 
                 metrics[ticker] = {
                     "price": current,
                     "change_pct": change_pct,
                 }
-                logger.info(f"✅ Got {ticker}: ${current:.2f}")
+                logger.info(f"✅ {ticker}: ${current:.2f} ({change_pct:+.2f}%)")
                 
             except Exception as e:
-                logger.error(f"Error fetching {ticker}: {e}")
+                logger.error(f"❌ Error fetching {ticker}: {str(e)[:100]}")
                 continue
         
-        logger.info(f"Market metrics: {len(metrics)} tickers")
+        logger.info(f"📈 Market metrics complete: {len(metrics)} tickers fetched")
         return metrics
     except Exception as e:
-        logger.error(f"Error in get_market_metrics: {e}")
+        logger.error(f"💥 Error in get_market_metrics: {str(e)[:100]}")
         return {}
 
 
@@ -179,12 +183,9 @@ def format_message(portfolio, metrics):
 # TELEGRAM BOT
 # ============================================================================
 
-async def send_hourly_report():
+def send_hourly_report():
     """Send hourly market report"""
     try:
-        bot = Bot(token=os.getenv("TELEGRAM_BOT_TOKEN"))
-        chat_id = int(os.getenv("TELEGRAM_CHAT_ID"))
-        
         logger.info("📊 Fetching portfolio data...")
         portfolio = get_portfolio_data()
         
@@ -194,22 +195,30 @@ async def send_hourly_report():
         logger.info("📝 Formatting message...")
         message = format_message(portfolio, metrics)
         
-        logger.info(f"📤 Sending to {chat_id}...")
-        await bot.send_message(chat_id=chat_id, text=message, parse_mode="Markdown")
-        logger.info(f"✅ Sent hourly report to {chat_id}")
+        logger.info(f"📤 Sending Telegram message...")
+        # Run the async send in a new event loop
+        asyncio.run(_send_telegram(message))
+        logger.info(f"✅ Sent hourly report!")
         
     except Exception as e:
         logger.error(f"❌ Failed to send report: {e}")
+
+
+async def _send_telegram(message):
+    """Send message via Telegram (async)"""
+    bot = Bot(token=os.getenv("TELEGRAM_BOT_TOKEN"))
+    chat_id = int(os.getenv("TELEGRAM_CHAT_ID"))
+    await bot.send_message(chat_id=chat_id, text=message, parse_mode="Markdown")
 
 
 # ============================================================================
 # SCHEDULER
 # ============================================================================
 
-async def main():
+def main():
     """Main scheduler loop"""
     try:
-        scheduler = AsyncIOScheduler()
+        scheduler = BackgroundScheduler()
         
         # Add hourly report job
         scheduler.add_job(
@@ -223,12 +232,17 @@ async def main():
         logger.info("✅ Scheduler started. Sending reports hourly")
         
         # Keep running
-        await asyncio.Event().wait()
+        import time
+        while True:
+            time.sleep(1)
         
+    except KeyboardInterrupt:
+        logger.info("🛑 Bot stopped")
+        scheduler.shutdown()
     except Exception as e:
         logger.error(f"❌ Scheduler error: {e}")
         raise
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
