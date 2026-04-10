@@ -25,12 +25,16 @@ load_dotenv()
 
 # Your Holdings
 HOLDINGS = {
-    "RKLB": {"shares": 100, "avg_cost": 15.50},
-    "NVDA": {"shares": 50, "avg_cost": 128.00},
-    "MSFT": {"shares": 30, "avg_cost": 380.00},
-    "ALAB": {"shares": 75, "avg_cost": 35.00},
-    "SCHD": {"shares": 200, "avg_cost": 55.00},
-    "INTC": {"shares": 40, "avg_cost": 28.00},
+    "RKLB": {"shares": 62, "avg_cost": 68.152},
+    "NVDA": {"shares": 10, "avg_cost": 175.90},
+    "MSFT": {"shares": 2, "avg_cost": 372.50},
+    "ALAB": {"shares": 3, "avg_cost": 116.00},
+    "SCHD": {"shares": 15, "avg_cost": 30.50},
+    "INTC": {"shares": 4, "avg_cost": 51.33},
+    "NBIS": {"shares": 5, "avg_cost": 114.90},
+    "NVDL": {"shares": 10, "avg_cost": 80.90},
+    "SLV": {"shares": 18, "avg_cost": 90.667},
+    "GRAB": {"shares": 284, "avg_cost": 5.899},
 }
 
 MARKET_TICKERS = ["SPY", "QQQ", "DIA", "VIX"]
