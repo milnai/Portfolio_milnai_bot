@@ -129,7 +129,8 @@ def format_message(portfolio, metrics):
     """Format the complete market report"""
     try:
         msg = "⏰ **Market Update**\n"
-        msg += f"__{datetime.now().strftime('%Y-%m-%d %H:%M UTC')}__\n\n"
+        now = datetime.now().strftime('%Y-%m-%d %H:%M UTC')
+        msg += f"__{now}__\n\n"
         
         # Market metrics
         msg += "📊 **MARKET METRICS**\n"
