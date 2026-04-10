@@ -197,7 +197,7 @@ async def main():
         # Add hourly report job
         scheduler.add_job(
             send_hourly_report,
-            CronTrigger(minute=0),  # Every hour at :00
+            CronTrigger(minute="*/1"),  # Every hour at :00
             id="hourly_report",
             name="Hourly Market Report"
         )
