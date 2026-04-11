@@ -37,7 +37,7 @@ HOLDINGS = {
     "GRAB": {"shares": 284, "avg_cost": 5.899},
 }
 
-MARKET_TICKERS = ["SPY", "QQQ", "DIA", "VIX"]
+MARKET_TICKERS = ["SPY", "QQQ"]
 
 # Logging
 logging.basicConfig(
