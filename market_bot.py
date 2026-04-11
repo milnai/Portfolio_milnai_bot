@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Advanced Telegram Market Bot - Layman-Friendly Technical Signals
-- Vulnerability signals (when to sell/prepare)
-- Opportunity signals (when to buy)
-- US EST market timing with SGT display
-- Monday-Friday trading week only
+Advanced Trading Bot - Technical Signals with Actionable Trading Levels
+- Entry/Exit prices with stop loss
+- Profit targets at multiple levels
+- Risk/Reward ratios
+- VIX-based urgency
 """
 
 import asyncio
@@ -44,6 +44,15 @@ HOLDINGS = {
 
 MARKET_TICKERS = ["SPY", "QQQ"]
 
+# Trading Rules
+POSITION_SIZE = 10  # shares per trade
+STOP_LOSS_PCT = 0.02  # 2% below entry
+PROFIT_TARGETS = [
+    {"shares": 3, "profit_per_share": 2.00},    # 3 shares at +$2
+    {"shares": 4, "profit_per_share": 4.00},    # 4 shares at +$4
+    {"shares": 3, "profit_per_share": 6.00},    # 3 shares at +$6
+]
+
 # Finnhub API
 FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY")
 FINNHUB_BASE_URL = "https://finnhub.io/api/v1"
@@ -60,11 +69,11 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ============================================================================
-# DATA FETCHING (Finnhub API)
+# DATA FETCHING
 # ============================================================================
 
 def get_stock_data(ticker):
-    """Get current price and historical data for technical analysis"""
+    """Get current price and historical data"""
     try:
         if not FINNHUB_API_KEY:
             logger.error("❌ FINNHUB_API_KEY not set!")
@@ -73,7 +82,7 @@ def get_stock_data(ticker):
         max_retries = 3
         for attempt in range(max_retries):
             try:
-                # Get current quote
+                # Current quote
                 url = f"{FINNHUB_BASE_URL}/quote"
                 params = {"symbol": ticker, "token": FINNHUB_API_KEY}
                 response = requests.get(url, params=params, timeout=10)
@@ -84,7 +93,6 @@ def get_stock_data(ticker):
                 data = response.json()
                 
                 if "c" not in data or data["c"] is None or data["c"] == 0:
-                    logger.warning(f"⚠️ No data for {ticker}")
                     return None
                 
                 current_price = float(data["c"])
@@ -92,12 +100,12 @@ def get_stock_data(ticker):
                 daily_change = current_price - prev_close
                 daily_change_pct = (daily_change / prev_close * 100) if prev_close > 0 else 0
                 
-                # Get historical candles for technical analysis
+                # Historical candles
                 url = f"{FINNHUB_BASE_URL}/stock/candle"
                 params = {
                     "symbol": ticker,
-                    "resolution": "D",  # Daily
-                    "count": 200,  # Last 200 days for MA200
+                    "resolution": "D",
+                    "count": 200,
                     "token": FINNHUB_API_KEY
                 }
                 response = requests.get(url, params=params, timeout=10)
@@ -124,23 +132,67 @@ def get_stock_data(ticker):
                 if attempt < max_retries - 1:
                     time.sleep(2 ** attempt)
                 else:
-                    logger.error(f"❌ Error fetching {ticker}: {str(e)[:100]}")
                     return None
     
     except Exception as e:
-        logger.error(f"❌ Error in get_stock_data: {str(e)[:100]}")
         return None
 
 
+def get_vix_sentiment():
+    """Get VIX level and sentiment"""
+    try:
+        if not FINNHUB_API_KEY:
+            return None
+        
+        url = f"{FINNHUB_BASE_URL}/quote"
+        params = {"symbol": "^VIX", "token": FINNHUB_API_KEY}
+        response = requests.get(url, params=params, timeout=10)
+        
+        if response.status_code == 200:
+            data = response.json()
+            if "c" in data and data["c"]:
+                vix = float(data["c"])
+                
+                if vix < 15:
+                    sentiment = "😌 **Calm & Confident** - Investors relaxed"
+                    emoji = "🟢"
+                elif vix < 20:
+                    sentiment = "😐 **Normal** - Average conditions"
+                    emoji = "🟡"
+                elif vix < 25:
+                    sentiment = "😟 **Getting Nervous** - Watch for dips"
+                    emoji = "🟠"
+                elif vix < 35:
+                    sentiment = "😰 **Fearful** - STRONG opportunity zone"
+                    emoji = "🔴"
+                else:
+                    sentiment = "😱 **PANIC MODE** - BEST buying time!"
+                    emoji = "🔴🔴"
+                
+                return {
+                    "level": vix,
+                    "sentiment": sentiment,
+                    "emoji": emoji,
+                    "is_fearful": vix > 25,
+                }
+    except:
+        pass
+    
+    return None
+
+
+# ============================================================================
+# TECHNICAL ANALYSIS
+# ============================================================================
+
 def calculate_rsi(closes, period=14):
-    """Calculate RSI (Relative Strength Index)"""
+    """Calculate RSI"""
     try:
         if len(closes) < period + 1:
             return None
         
         closes = np.array(closes[-period-1:], dtype=float)
         deltas = np.diff(closes)
-        
         gains = np.where(deltas > 0, deltas, 0)
         losses = np.where(deltas < 0, -deltas, 0)
         
@@ -152,7 +204,6 @@ def calculate_rsi(closes, period=14):
         
         rs = avg_gain / avg_loss
         rsi = 100 - (100 / (1 + rs))
-        
         return rsi
     except:
         return None
@@ -183,57 +234,13 @@ def calculate_ma(closes, period=200):
             return None
         
         closes = np.array(closes[-period:], dtype=float)
-        ma = np.mean(closes)
-        
-        return ma
+        return np.mean(closes)
     except:
         return None
 
 
-def get_vix_sentiment():
-    """Get VIX level and sentiment"""
-    try:
-        if not FINNHUB_API_KEY:
-            return None
-        
-        # VIX ticker
-        url = f"{FINNHUB_BASE_URL}/quote"
-        params = {"symbol": "^VIX", "token": FINNHUB_API_KEY}
-        response = requests.get(url, params=params, timeout=10)
-        
-        if response.status_code == 200:
-            data = response.json()
-            if "c" in data and data["c"]:
-                vix = float(data["c"])
-                
-                # Sentiment analysis
-                if vix < 15:
-                    sentiment = "😌 **Calm & Confident** - Investors relaxed, be cautious (peak greed)"
-                    emoji = "🟢"
-                elif vix < 20:
-                    sentiment = "😐 **Normal** - Average market conditions"
-                    emoji = "🟡"
-                elif vix < 25:
-                    sentiment = "😟 **Getting Nervous** - Some worry emerging, watch for dips"
-                    emoji = "🟠"
-                elif vix < 35:
-                    sentiment = "😰 **Fearful** - Investors scared, STRONG buying opportunity"
-                    emoji = "🔴"
-                else:
-                    sentiment = "😱 **PANIC MODE** - Extreme fear, MAJOR dip, best buying time!"
-                    emoji = "🔴🔴"
-                
-                return {
-                    "level": vix,
-                    "sentiment": sentiment,
-                    "emoji": emoji,
-                    "is_fearful": vix > 25,  # Flag for high VIX
-                }
-    except Exception as e:
-        logger.error(f"❌ Error fetching VIX: {str(e)[:100]}")
-    
-    return None
-    """Analyze technical signals - return buy/sell signals in layman's terms"""
+def generate_trading_signal(data):
+    """Generate trading signal with entry/exit prices and profit targets"""
     try:
         ticker = data["ticker"]
         current = data["current_price"]
@@ -241,40 +248,43 @@ def get_vix_sentiment():
         closes = data["closes"]
         volumes = data["volumes"]
         
-        vulnerability_signals = []
-        opportunity_signals = []
-        
-        # RSI Analysis
         rsi = calculate_rsi(closes)
-        if rsi:
-            if rsi > 70:
-                vulnerability_signals.append("🔥 Stock running too hot (overbought)")
-            elif rsi < 30:
-                opportunity_signals.append("❄️ Stock hit the floor (oversold)")
-        
-        # Bollinger Bands Analysis
         bb = calculate_bollinger_bands(closes)
-        if bb:
-            if current > bb["upper"]:
-                vulnerability_signals.append("📈 Hit the ceiling (stretched too far up)")
-            elif current < bb["lower"]:
-                opportunity_signals.append("📉 Touching the bottom (sweet spot to buy)")
-        
-        # 200-day MA Analysis
         ma200 = calculate_ma(closes, 200)
+        
+        # Determine signal type (BUY or SELL)
+        buy_signals = 0
+        sell_signals = 0
+        signal_details = []
+        
+        # RSI signals
+        if rsi:
+            if rsi < 30:
+                buy_signals += 1
+                signal_details.append("❄️ Stock hit the floor (RSI oversold)")
+            elif rsi > 70:
+                sell_signals += 1
+                signal_details.append("🔥 Stock running too hot (RSI overbought)")
+        
+        # Bollinger Bands signals
+        if bb:
+            if current < bb["lower"]:
+                buy_signals += 1
+                signal_details.append("📉 Touching the bottom (BB lower)")
+            elif current > bb["upper"]:
+                sell_signals += 1
+                signal_details.append("📈 Hit the ceiling (BB upper)")
+        
+        # 200-day MA signals
         if ma200:
             if current < ma200:
-                vulnerability_signals.append("⬇️ Below long-term trend (downtrend zone)")
+                sell_signals += 1
+                signal_details.append("⬇️ Below long-term trend")
             elif current > ma200:
-                opportunity_signals.append("✅ Above long-term support (strong base)")
+                buy_signals += 1
+                signal_details.append("✅ Above long-term support")
         
-        # Daily change Analysis
-        if daily_pct < -3:
-            vulnerability_signals.append(f"🔴 Big red day ({daily_pct:.2f}%) - Heavy selling")
-        elif daily_pct > 3:
-            opportunity_signals.append(f"🟢 Big green day ({daily_pct:.2f}%) - Heavy buying")
-        
-        # Volume Analysis
+        # Volume signals
         if len(volumes) > 1:
             today_volume = volumes[-1]
             avg_volume = np.mean(volumes[-20:])
@@ -282,22 +292,112 @@ def get_vix_sentiment():
             
             if volume_ratio > 1.5:
                 if daily_pct < 0:
-                    vulnerability_signals.append("📊 Heavy volume on red day (panic dump)")
+                    sell_signals += 1
+                    signal_details.append("📊 Heavy volume on red day")
                 else:
-                    opportunity_signals.append("📊 Heavy volume on green day (real buyers)")
+                    buy_signals += 1
+                    signal_details.append("📊 Heavy volume on green day")
+        
+        # Determine action
+        signal_type = None
+        entry_price = None
+        exit_price = None
+        
+        if buy_signals >= 2:
+            signal_type = "BUY"
+            entry_price = bb["lower"] if bb else current * 0.98  # Buy at BB lower or 2% below
+            
+        elif sell_signals >= 2:
+            signal_type = "SELL"
+            exit_price = bb["upper"] if bb else current * 1.02  # Sell at BB upper or 2% above
         
         return {
             "ticker": ticker,
             "current": current,
             "daily_pct": daily_pct,
+            "signal_type": signal_type,
+            "entry_price": entry_price,
+            "exit_price": exit_price,
             "rsi": rsi,
-            "vulnerability": vulnerability_signals,
-            "opportunity": opportunity_signals,
+            "bb": bb,
+            "ma200": ma200,
+            "signals": signal_details,
         }
     
     except Exception as e:
-        logger.error(f"❌ Error analyzing signals: {str(e)[:100]}")
+        logger.error(f"❌ Error generating signal: {str(e)[:100]}")
         return None
+
+
+# ============================================================================
+# TRADING ORDER GENERATION
+# ============================================================================
+
+def generate_buy_order(signal, vix_is_fearful):
+    """Generate a BUY trading order with entry/exit and profit targets"""
+    ticker = signal["ticker"]
+    current = signal["current"]
+    entry = signal["entry_price"]
+    stop_loss = entry * (1 - STOP_LOSS_PCT)
+    
+    # Build profit targets
+    pt_lines = []
+    total_profit = 0
+    total_shares = 0
+    
+    for i, target in enumerate(PROFIT_TARGETS):
+        shares = target["shares"]
+        profit_per_share = target["profit_per_share"]
+        exit_price = entry + profit_per_share
+        profit = shares * profit_per_share
+        
+        total_shares += shares
+        total_profit += profit
+        
+        pt_lines.append(f"   • Sell {shares} @ ${exit_price:.2f} (${profit_per_share:+.2f}/share)")
+    
+    # Risk/Reward
+    risk = (entry - stop_loss) * POSITION_SIZE
+    reward = total_profit
+    rr_ratio = reward / risk if risk > 0 else 0
+    
+    # Build message
+    msg = "🟢 **RECOMMENDED BUY**\n"
+    if vix_is_fearful:
+        msg = "🔥 **HIGHLY RECOMMENDED BUY** - Market is fearful!\n"
+    
+    msg += f"\n**{ticker}**\n"
+    msg += f"Current Price: ${current:.2f}\n"
+    msg += f"Entry Price: ${entry:.2f}\n"
+    msg += f"Position: BUY {POSITION_SIZE} shares @ ${entry:.2f} = ${entry*POSITION_SIZE:,.0f}\n\n"
+    
+    msg += f"🛑 **Stop Loss: ${stop_loss:.2f}** (cut losses at -2%)\n\n"
+    
+    msg += f"🎯 **Profit Targets (sell in stages):**\n"
+    for line in pt_lines:
+        msg += f"{line}\n"
+    
+    msg += f"\n📊 **Risk/Reward: 1 : {rr_ratio:.2f}**\n"
+    
+    return msg
+
+
+def generate_sell_order(signal):
+    """Generate a SELL order to protect profits"""
+    ticker = signal["ticker"]
+    current = signal["current"]
+    exit_price = signal["exit_price"]
+    take_loss = current * (1 - STOP_LOSS_PCT)
+    
+    msg = "🔴 **PREPARE TO SELL** - Stock is overbought\n\n"
+    msg += f"**{ticker}**\n"
+    msg += f"Current Price: ${current:.2f}\n"
+    msg += f"Sell Price: ${exit_price:.2f}\n"
+    msg += f"Position: SELL {POSITION_SIZE} shares @ ${exit_price:.2f} = ${exit_price*POSITION_SIZE:,.0f}\n\n"
+    msg += f"⚠️ **Stop Loss if drops to: ${take_loss:.2f}** (cut if bearish reversal)\n"
+    msg += f"\n📊 This is peak profit zone - take gains here!\n"
+    
+    return msg
 
 
 # ============================================================================
@@ -316,19 +416,17 @@ def get_time_display():
 
 
 def format_market_report(portfolio, market_metrics, vix):
-    """Format market update with portfolio P&L and VIX sentiment"""
+    """Format market update with portfolio"""
     try:
         times = get_time_display()
         
         msg = "🕐 **MARKET SNAPSHOT**\n"
         msg += f"__{times['sgt']} (SGT) | {times['est']} (EST)__\n\n"
         
-        # VIX Sentiment
         if vix:
             msg += f"{vix['emoji']} **VIX: {vix['level']:.2f}**\n"
             msg += f"{vix['sentiment']}\n\n"
         
-        # Market metrics
         msg += "📊 **MARKET INDICES**\n"
         if market_metrics:
             for ticker, data in market_metrics.items():
@@ -336,7 +434,6 @@ def format_market_report(portfolio, market_metrics, vix):
                 msg += f"{emoji} {ticker}: ${data['current']:.2f} ({data['daily_pct']:+.2f}%)\n"
         msg += "\n"
         
-        # Portfolio summary
         if portfolio.get("positions", {}):
             msg += "💼 **PORTFOLIO**\n"
             for ticker, pos in portfolio["positions"].items():
@@ -350,72 +447,58 @@ def format_market_report(portfolio, market_metrics, vix):
         return msg
     except Exception as e:
         logger.error(f"❌ Error formatting market report: {e}")
-        return "❌ Error formatting report"
+        return "❌ Error"
 
 
-def format_signal_report(vix):
-    """Format buy/sell opportunity report with VIX-based recommendations"""
+def format_trading_signals(vix):
+    """Format trading orders with entry/exit prices"""
     try:
         times = get_time_display()
         
-        msg = "🔍 **TECHNICAL ANALYSIS SIGNALS**\n"
+        msg = "📈 **TRADING SIGNALS**\n"
         msg += f"__{times['sgt']} (SGT) | {times['est']} (EST)__\n\n"
         
-        # VIX Sentiment
         if vix:
-            msg += f"{vix['emoji']} **VIX: {vix['level']:.2f}** - {vix['sentiment']}\n\n"
+            msg += f"{vix['emoji']} **VIX: {vix['level']:.2f}}** - {vix['sentiment']}\n\n"
         
-        vulnerable_stocks = []
-        opportunity_stocks = []
+        buy_orders = []
+        sell_orders = []
         
         # Analyze all holdings
         for ticker in HOLDINGS.keys():
             data = get_stock_data(ticker)
             if data:
-                signals = analyze_signals(data)
-                if signals:
-                    if signals["vulnerability"]:
-                        vulnerable_stocks.append(signals)
-                    if signals["opportunity"]:
-                        opportunity_stocks.append(signals)
+                signal = generate_trading_signal(data)
+                if signal and signal["signal_type"]:
+                    if signal["signal_type"] == "BUY":
+                        buy_orders.append((signal, vix and vix["is_fearful"]))
+                    elif signal["signal_type"] == "SELL":
+                        sell_orders.append(signal)
         
-        # Format vulnerability alerts
-        if vulnerable_stocks:
-            msg += "🔴 **WATCH OUT - VULNERABLE TO DIP**\n"
-            for stock in vulnerable_stocks:
-                msg += f"\n**{stock['ticker']}** (${stock['current']:.2f}, {stock['daily_pct']:+.2f}%)\n"
-                for signal in stock["vulnerability"]:
-                    msg += f"  • {signal}\n"
-                msg += "  → Consider preparing to sell\n"
+        # Format BUY orders
+        if buy_orders:
+            for signal, fearful in buy_orders:
+                msg += generate_buy_order(signal, fearful) + "\n\n"
         else:
-            msg += "🔴 **VULNERABLE STOCKS:** None right now\n"
+            msg += "🟢 **BUY OPPORTUNITIES:** None right now\n\n"
         
-        msg += "\n" + "="*45 + "\n"
+        msg += "="*45 + "\n"
         
-        # Format opportunity alerts
-        if opportunity_stocks:
-            msg += "🟢 **BUYING OPPORTUNITIES**\n"
-            for stock in opportunity_stocks:
-                msg += f"\n**{stock['ticker']}** (${stock['current']:.2f}, {stock['daily_pct']:+.2f}%)\n"
-                for signal in stock["opportunity"]:
-                    msg += f"  • {signal}\n"
-                
-                # Mark as HIGHLY RECOMMENDED if VIX is high (fearful market)
-                if vix and vix["is_fearful"]:
-                    msg += f"  → 🔥 **HIGHLY RECOMMENDED** - VIX is {vix['level']:.0f}, market fearful, strong buy signal!\n"
-                else:
-                    msg += "  → Consider buying the dip\n"
+        # Format SELL orders
+        if sell_orders:
+            for signal in sell_orders:
+                msg += generate_sell_order(signal) + "\n\n"
         else:
-            msg += "🟢 **BUYING OPPORTUNITIES:** None right now\n"
+            msg += "🔴 **SELL SIGNALS:** None right now\n"
         
         return msg
     except Exception as e:
-        logger.error(f"❌ Error formatting signal report: {e}")
-        return "❌ Error formatting signals"
+        logger.error(f"❌ Error formatting signals: {e}")
+        return "❌ Error"
 
 
 # ============================================================================
-# PORTFOLIO ANALYSIS
+# PORTFOLIO
 # ============================================================================
 
 def get_portfolio_data():
@@ -464,7 +547,6 @@ def get_market_metrics():
     """Get market indices"""
     try:
         metrics = {}
-        
         for ticker in MARKET_TICKERS:
             data = get_stock_data(ticker)
             if data:
@@ -472,10 +554,8 @@ def get_market_metrics():
                     "current": data["current_price"],
                     "daily_pct": data["daily_change_pct"],
                 }
-        
         return metrics if metrics else None
-    except Exception as e:
-        logger.error(f"❌ Error in get_market_metrics: {str(e)[:100]}")
+    except:
         return None
 
 
@@ -484,7 +564,7 @@ def get_market_metrics():
 # ============================================================================
 
 def send_market_report():
-    """Send market snapshot + portfolio"""
+    """Send market snapshot"""
     try:
         logger.info("📊 Fetching market data...")
         portfolio = get_portfolio_data()
@@ -497,66 +577,65 @@ def send_market_report():
         asyncio.run(_send_telegram(message))
         logger.info("✅ Sent market report!")
     except Exception as e:
-        logger.error(f"❌ Failed to send market report: {e}")
+        logger.error(f"❌ Failed: {e}")
 
 
-def send_signal_report():
-    """Send technical signals (buy/sell opportunities)"""
+def send_trading_signals():
+    """Send trading orders with entry/exit prices"""
     try:
-        logger.info("🔍 Analyzing technical signals...")
+        logger.info("📈 Analyzing trading signals...")
         vix = get_vix_sentiment()
-        message = format_signal_report(vix)
+        message = format_trading_signals(vix)
         
-        logger.info("📤 Sending signal report...")
+        logger.info("📤 Sending trading signals...")
         asyncio.run(_send_telegram(message))
-        logger.info("✅ Sent signal report!")
+        logger.info("✅ Sent trading signals!")
     except Exception as e:
-        logger.error(f"❌ Failed to send signal report: {e}")
+        logger.error(f"❌ Failed: {e}")
 
 
 async def _send_telegram(message):
-    """Send message via Telegram (async)"""
+    """Send message via Telegram"""
     bot = Bot(token=os.getenv("TELEGRAM_BOT_TOKEN"))
     chat_id = int(os.getenv("TELEGRAM_CHAT_ID"))
     await bot.send_message(chat_id=chat_id, text=message, parse_mode="Markdown")
 
 # ============================================================================
-# SCHEDULER (US EST TIMING)
+# SCHEDULER
 # ============================================================================
 
 def main():
-    """Main scheduler with US EST market hours"""
+    """Main scheduler"""
     try:
         scheduler = BackgroundScheduler(timezone=EST)
         
-        # Pre-market: 6:30 AM - 9:30 AM EST (every hour)
+        # Pre-market: hourly
         scheduler.add_job(
             send_market_report,
             CronTrigger(hour='6-9', minute=30, day_of_week='mon-fri'),
             id="pre_market",
-            name="Pre-Market Report"
+            name="Pre-Market"
         )
         
-        # Market hours: 9:30 AM - 4:00 PM EST (every hour)
+        # Market hours: hourly
         scheduler.add_job(
             send_market_report,
             CronTrigger(hour='9-16', minute=30, day_of_week='mon-fri'),
             id="market_hours",
-            name="Market Hours Report"
+            name="Market Hours"
         )
         
-        # Post-market first 2 hours: 4:00 PM - 6:00 PM EST (every 30 mins)
+        # Post-market: every 30 mins with trading signals
         scheduler.add_job(
-            send_signal_report,
+            send_trading_signals,
             CronTrigger(hour='16-17', minute='0,30', day_of_week='mon-fri'),
             id="post_market",
-            name="Post-Market Signals"
+            name="Trading Signals"
         )
         
         scheduler.start()
-        logger.info("✅ Scheduler started - US EST market timing active")
+        logger.info("✅ Trading Bot Started - US EST Timing Active")
         
-        # Keep running
         import time
         while True:
             time.sleep(1)
