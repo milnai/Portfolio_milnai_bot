@@ -61,33 +61,47 @@ def get_portfolio_data():
         for ticker, info in HOLDINGS.items():
             try:
                 logger.info(f"📊 Fetching {ticker}...")
-                data = yf.download(ticker, period="1d", progress=False, timeout=10)
                 
-                if data is None or data.empty:
-                    logger.warning(f"⚠️ No data for {ticker}")
-                    continue
-                
-                current_price = float(data['Close'].values[-1].item())
-                shares = info["shares"]
-                avg_cost = info["avg_cost"]
-                
-                cost = shares * avg_cost
-                value = shares * current_price
-                pnl = value - cost
-                pnl_pct = (pnl / cost * 100) if cost > 0 else 0
-                
-                total_cost += cost
-                total_value += value
-                
-                positions[ticker] = {
-                    "price": current_price,
-                    "pnl": pnl,
-                    "pnl_pct": pnl_pct,
-                }
-                logger.info(f"✅ {ticker}: ${current_price:.2f} | PnL: ${pnl:.2f} ({pnl_pct:.2f}%)")
+                # Retry logic for rate limiting
+                max_retries = 3
+                for attempt in range(max_retries):
+                    try:
+                        data = yf.download(ticker, period="1d", progress=False, timeout=15)
+                        
+                        if data is None or data.empty:
+                            logger.warning(f"⚠️ No data for {ticker}")
+                            break
+                        
+                        current_price = float(data['Close'].values[-1].item())
+                        shares = info["shares"]
+                        avg_cost = info["avg_cost"]
+                        
+                        cost = shares * avg_cost
+                        value = shares * current_price
+                        pnl = value - cost
+                        pnl_pct = (pnl / cost * 100) if cost > 0 else 0
+                        
+                        total_cost += cost
+                        total_value += value
+                        
+                        positions[ticker] = {
+                            "price": current_price,
+                            "pnl": pnl,
+                            "pnl_pct": pnl_pct,
+                        }
+                        logger.info(f"✅ {ticker}: ${current_price:.2f} | PnL: ${pnl:.2f} ({pnl_pct:.2f}%)")
+                        break  # Success, exit retry loop
+                        
+                    except Exception as e:
+                        if attempt < max_retries - 1:
+                            import time
+                            time.sleep(2 ** attempt)  # Exponential backoff: 1s, 2s, 4s
+                            logger.info(f"⏳ Retrying {ticker} (attempt {attempt + 2}/{max_retries})")
+                        else:
+                            logger.error(f"❌ Error fetching {ticker} after {max_retries} retries: {str(e)[:100]}")
                 
             except Exception as e:
-                logger.error(f"❌ Error fetching {ticker}: {str(e)[:100]}")
+                logger.error(f"❌ Error processing {ticker}: {str(e)[:100]}")
                 continue
         
         total_pnl = total_value - total_cost
@@ -114,25 +128,39 @@ def get_market_metrics():
         for ticker in MARKET_TICKERS:
             try:
                 logger.info(f"📊 Fetching market ticker {ticker}...")
-                data = yf.download(ticker, period="5d", progress=False, timeout=10)
                 
-                if data is None or data.empty:
-                    logger.warning(f"⚠️ No data for {ticker}")
-                    continue
-                
-                close = data['Close']
-                current = float(close.values[-1].item())
-                prev_close = float(close.values[-2].item())
-                change_pct = ((current - prev_close) / prev_close * 100) if prev_close > 0 else 0
-                
-                metrics[ticker] = {
-                    "price": current,
-                    "change_pct": change_pct,
-                }
-                logger.info(f"✅ {ticker}: ${current:.2f} ({change_pct:+.2f}%)")
+                # Retry logic for rate limiting
+                max_retries = 3
+                for attempt in range(max_retries):
+                    try:
+                        data = yf.download(ticker, period="5d", progress=False, timeout=15)
+                        
+                        if data is None or data.empty:
+                            logger.warning(f"⚠️ No data for {ticker}")
+                            break
+                        
+                        close = data['Close']
+                        current = float(close.values[-1].item())
+                        prev_close = float(close.values[-2].item())
+                        change_pct = ((current - prev_close) / prev_close * 100) if prev_close > 0 else 0
+                        
+                        metrics[ticker] = {
+                            "price": current,
+                            "change_pct": change_pct,
+                        }
+                        logger.info(f"✅ {ticker}: ${current:.2f} ({change_pct:+.2f}%)")
+                        break  # Success, exit retry loop
+                        
+                    except Exception as e:
+                        if attempt < max_retries - 1:
+                            import time
+                            time.sleep(2 ** attempt)  # Exponential backoff
+                            logger.info(f"⏳ Retrying {ticker} (attempt {attempt + 2}/{max_retries})")
+                        else:
+                            logger.error(f"❌ Error fetching {ticker} after {max_retries} retries: {str(e)[:100]}")
                 
             except Exception as e:
-                logger.error(f"❌ Error fetching {ticker}: {str(e)[:100]}")
+                logger.error(f"❌ Error processing {ticker}: {str(e)[:100]}")
                 continue
         
         logger.info(f"📈 Market metrics complete: {len(metrics)} tickers fetched")
