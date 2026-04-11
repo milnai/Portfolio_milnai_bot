@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """
-Simplified Telegram Market Bot - Hourly Stock & Market Updates
-No complex indicator calculations - just portfolio + market metrics
+Telegram Market Bot - Hourly Stock & Market Updates
+Uses Finnhub API for live, reliable stock data
 """
 
 import asyncio
 import os
 import logging
 from datetime import datetime
+import requests
+import time
 
-import yfinance as yf
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from telegram import Bot
@@ -18,12 +19,11 @@ from dotenv import load_dotenv
 # Load environment variables
 load_dotenv()
 
-
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
 
-# Your Holdings
+# Your Holdings (core positions)
 HOLDINGS = {
     "RKLB": {"shares": 62, "avg_cost": 68.152},
     "NVDA": {"shares": 10, "avg_cost": 175.90},
@@ -31,13 +31,13 @@ HOLDINGS = {
     "ALAB": {"shares": 3, "avg_cost": 116.00},
     "SCHD": {"shares": 15, "avg_cost": 30.50},
     "INTC": {"shares": 4, "avg_cost": 51.33},
-    "NBIS": {"shares": 5, "avg_cost": 114.90},
-    "NVDL": {"shares": 10, "avg_cost": 80.90},
-    "SLV": {"shares": 18, "avg_cost": 90.667},
-    "GRAB": {"shares": 284, "avg_cost": 5.899},
 }
 
 MARKET_TICKERS = ["SPY", "QQQ"]
+
+# Finnhub API
+FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY")
+FINNHUB_BASE_URL = "https://finnhub.io/api/v1"
 
 # Logging
 logging.basicConfig(
@@ -46,14 +46,17 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-
 # ============================================================================
-# DATA FETCHING
+# DATA FETCHING (Finnhub API)
 # ============================================================================
 
 def get_portfolio_data():
-    """Get current portfolio data"""
+    """Get current portfolio data from Finnhub"""
     try:
+        if not FINNHUB_API_KEY:
+            logger.error("❌ FINNHUB_API_KEY not set!")
+            return {"positions": {}, "total_value": 0, "total_pnl": 0, "total_pnl_pct": 0}
+        
         total_cost = 0
         total_value = 0
         positions = {}
@@ -62,17 +65,26 @@ def get_portfolio_data():
             try:
                 logger.info(f"📊 Fetching {ticker}...")
                 
-                # Retry logic for rate limiting
+                # Retry logic
                 max_retries = 3
                 for attempt in range(max_retries):
                     try:
-                        data = yf.download(ticker, period="1d", progress=False, timeout=15)
+                        # Finnhub quote endpoint
+                        url = f"{FINNHUB_BASE_URL}/quote"
+                        params = {"symbol": ticker, "token": FINNHUB_API_KEY}
+                        response = requests.get(url, params=params, timeout=10)
                         
-                        if data is None or data.empty:
+                        if response.status_code != 200:
+                            raise Exception(f"HTTP {response.status_code}")
+                        
+                        data = response.json()
+                        
+                        # Check if we got valid data
+                        if "c" not in data or data["c"] is None or data["c"] == 0:
                             logger.warning(f"⚠️ No data for {ticker}")
                             break
                         
-                        current_price = float(data['Close'].values[-1].item())
+                        current_price = float(data["c"])
                         shares = info["shares"]
                         avg_cost = info["avg_cost"]
                         
@@ -90,12 +102,11 @@ def get_portfolio_data():
                             "pnl_pct": pnl_pct,
                         }
                         logger.info(f"✅ {ticker}: ${current_price:.2f} | PnL: ${pnl:.2f} ({pnl_pct:.2f}%)")
-                        break  # Success, exit retry loop
+                        break  # Success
                         
                     except Exception as e:
                         if attempt < max_retries - 1:
-                            import time
-                            time.sleep(2 ** attempt)  # Exponential backoff: 1s, 2s, 4s
+                            time.sleep(2 ** attempt)  # Exponential backoff
                             logger.info(f"⏳ Retrying {ticker} (attempt {attempt + 2}/{max_retries})")
                         else:
                             logger.error(f"❌ Error fetching {ticker} after {max_retries} retries: {str(e)[:100]}")
@@ -121,27 +132,37 @@ def get_portfolio_data():
 
 
 def get_market_metrics():
-    """Get market metrics"""
+    """Get market metrics from Finnhub"""
     try:
+        if not FINNHUB_API_KEY:
+            logger.error("❌ FINNHUB_API_KEY not set!")
+            return {}
+        
         metrics = {}
         
         for ticker in MARKET_TICKERS:
             try:
                 logger.info(f"📊 Fetching market ticker {ticker}...")
                 
-                # Retry logic for rate limiting
+                # Retry logic
                 max_retries = 3
                 for attempt in range(max_retries):
                     try:
-                        data = yf.download(ticker, period="5d", progress=False, timeout=15)
+                        url = f"{FINNHUB_BASE_URL}/quote"
+                        params = {"symbol": ticker, "token": FINNHUB_API_KEY}
+                        response = requests.get(url, params=params, timeout=10)
                         
-                        if data is None or data.empty:
+                        if response.status_code != 200:
+                            raise Exception(f"HTTP {response.status_code}")
+                        
+                        data = response.json()
+                        
+                        if "c" not in data or data["c"] is None or data["c"] == 0:
                             logger.warning(f"⚠️ No data for {ticker}")
                             break
                         
-                        close = data['Close']
-                        current = float(close.values[-1].item())
-                        prev_close = float(close.values[-2].item())
+                        current = float(data["c"])
+                        prev_close = float(data.get("pc", current))  # pc = previous close
                         change_pct = ((current - prev_close) / prev_close * 100) if prev_close > 0 else 0
                         
                         metrics[ticker] = {
@@ -149,12 +170,11 @@ def get_market_metrics():
                             "change_pct": change_pct,
                         }
                         logger.info(f"✅ {ticker}: ${current:.2f} ({change_pct:+.2f}%)")
-                        break  # Success, exit retry loop
+                        break  # Success
                         
                     except Exception as e:
                         if attempt < max_retries - 1:
-                            import time
-                            time.sleep(2 ** attempt)  # Exponential backoff
+                            time.sleep(2 ** attempt)
                             logger.info(f"⏳ Retrying {ticker} (attempt {attempt + 2}/{max_retries})")
                         else:
                             logger.error(f"❌ Error fetching {ticker} after {max_retries} retries: {str(e)[:100]}")
@@ -169,15 +189,14 @@ def get_market_metrics():
         logger.error(f"💥 Error in get_market_metrics: {str(e)[:100]}")
         return {}
 
-
 # ============================================================================
 # MESSAGE FORMATTING
 # ============================================================================
 
 def format_message(portfolio, metrics):
-    """Format the complete market report"""
+    """Format the market report message"""
     try:
-        msg = "⏰ **Market Update**\n"
+        msg = "🕐 **Market Update**\n"
         now = datetime.now().strftime('%Y-%m-%d %H:%M UTC')
         msg += f"__{now}__\n\n"
         
@@ -185,7 +204,7 @@ def format_message(portfolio, metrics):
         msg += "📊 **MARKET METRICS**\n"
         if metrics and len(metrics) > 0:
             for ticker, data in metrics.items():
-                emoji = "📈" if data["change_pct"] >= 0 else "📉"
+                emoji = "🟢" if data['change_pct'] >= 0 else "🔴"
                 msg += f"{emoji} {ticker}: ${data['price']:.2f} ({data['change_pct']:+.2f}%)\n"
         else:
             msg += "_(No market data)_\n"
@@ -193,23 +212,21 @@ def format_message(portfolio, metrics):
         
         # Portfolio
         msg += "💼 **PORTFOLIO**\n"
-        if portfolio and len(portfolio.get("positions", {})) > 0:
-            for ticker, pos in portfolio["positions"].items():
-                emoji = "🟢" if pos["pnl"] >= 0 else "🔴"
-                msg += f"{emoji} {ticker}: ${pos['price']:.2f} ({pos['pnl_pct']:+.2f}%)\n"
+        if portfolio.get("positions", {}) and len(portfolio["positions"]) > 0:
+            for ticker, data in portfolio["positions"].items():
+                emoji = "🟢" if data['pnl_pct'] >= 0 else "🔴"
+                msg += f"{emoji} {ticker}: ${data['price']:.2f} | PnL: {data['pnl']:+.2f} ({data['pnl_pct']:+.2f}%)\n"
             
             msg += "\n" + "="*40 + "\n"
-            total_emoji = "🟢" if portfolio["total_pnl"] >= 0 else "🔴"
-            msg += f"{total_emoji} **TOTAL P&L**: ${portfolio['total_pnl']:+.2f} "
-            msg += f"({portfolio['total_pnl_pct']:+.2f}%)\n"
+            total_emoji = "🟢" if portfolio['total_pnl_pct'] >= 0 else "🔴"
+            msg += f"{total_emoji} **TOTAL P&L:** ${portfolio['total_pnl']:+.2f} ({portfolio['total_pnl_pct']:+.2f}%)\n"
         else:
             msg += "_(No portfolio data)_\n"
         
         return msg
     except Exception as e:
-        logger.error(f"Error formatting message: {e}")
+        logger.error(f"❌ Error formatting message: {e}")
         return "❌ Error formatting report"
-
 
 # ============================================================================
 # TELEGRAM BOT
@@ -241,7 +258,6 @@ async def _send_telegram(message):
     bot = Bot(token=os.getenv("TELEGRAM_BOT_TOKEN"))
     chat_id = int(os.getenv("TELEGRAM_CHAT_ID"))
     await bot.send_message(chat_id=chat_id, text=message, parse_mode="Markdown")
-
 
 # ============================================================================
 # SCHEDULER
