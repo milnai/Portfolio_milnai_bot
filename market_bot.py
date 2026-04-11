@@ -190,7 +190,49 @@ def calculate_ma(closes, period=200):
         return None
 
 
-def analyze_signals(data):
+def get_vix_sentiment():
+    """Get VIX level and sentiment"""
+    try:
+        if not FINNHUB_API_KEY:
+            return None
+        
+        # VIX ticker
+        url = f"{FINNHUB_BASE_URL}/quote"
+        params = {"symbol": "^VIX", "token": FINNHUB_API_KEY}
+        response = requests.get(url, params=params, timeout=10)
+        
+        if response.status_code == 200:
+            data = response.json()
+            if "c" in data and data["c"]:
+                vix = float(data["c"])
+                
+                # Sentiment analysis
+                if vix < 15:
+                    sentiment = "😌 **Calm & Confident** - Investors relaxed, be cautious (peak greed)"
+                    emoji = "🟢"
+                elif vix < 20:
+                    sentiment = "😐 **Normal** - Average market conditions"
+                    emoji = "🟡"
+                elif vix < 25:
+                    sentiment = "😟 **Getting Nervous** - Some worry emerging, watch for dips"
+                    emoji = "🟠"
+                elif vix < 35:
+                    sentiment = "😰 **Fearful** - Investors scared, STRONG buying opportunity"
+                    emoji = "🔴"
+                else:
+                    sentiment = "😱 **PANIC MODE** - Extreme fear, MAJOR dip, best buying time!"
+                    emoji = "🔴🔴"
+                
+                return {
+                    "level": vix,
+                    "sentiment": sentiment,
+                    "emoji": emoji,
+                    "is_fearful": vix > 25,  # Flag for high VIX
+                }
+    except Exception as e:
+        logger.error(f"❌ Error fetching VIX: {str(e)[:100]}")
+    
+    return None
     """Analyze technical signals - return buy/sell signals in layman's terms"""
     try:
         ticker = data["ticker"]
@@ -273,13 +315,18 @@ def get_time_display():
     }
 
 
-def format_market_report(portfolio, market_metrics):
-    """Format market update with portfolio P&L"""
+def format_market_report(portfolio, market_metrics, vix):
+    """Format market update with portfolio P&L and VIX sentiment"""
     try:
         times = get_time_display()
         
         msg = "🕐 **MARKET SNAPSHOT**\n"
         msg += f"__{times['sgt']} (SGT) | {times['est']} (EST)__\n\n"
+        
+        # VIX Sentiment
+        if vix:
+            msg += f"{vix['emoji']} **VIX: {vix['level']:.2f}**\n"
+            msg += f"{vix['sentiment']}\n\n"
         
         # Market metrics
         msg += "📊 **MARKET INDICES**\n"
@@ -306,13 +353,17 @@ def format_market_report(portfolio, market_metrics):
         return "❌ Error formatting report"
 
 
-def format_signal_report():
-    """Format buy/sell opportunity report"""
+def format_signal_report(vix):
+    """Format buy/sell opportunity report with VIX-based recommendations"""
     try:
         times = get_time_display()
         
         msg = "🔍 **TECHNICAL ANALYSIS SIGNALS**\n"
         msg += f"__{times['sgt']} (SGT) | {times['est']} (EST)__\n\n"
+        
+        # VIX Sentiment
+        if vix:
+            msg += f"{vix['emoji']} **VIX: {vix['level']:.2f}** - {vix['sentiment']}\n\n"
         
         vulnerable_stocks = []
         opportunity_stocks = []
@@ -348,7 +399,12 @@ def format_signal_report():
                 msg += f"\n**{stock['ticker']}** (${stock['current']:.2f}, {stock['daily_pct']:+.2f}%)\n"
                 for signal in stock["opportunity"]:
                     msg += f"  • {signal}\n"
-                msg += "  → Consider buying the dip\n"
+                
+                # Mark as HIGHLY RECOMMENDED if VIX is high (fearful market)
+                if vix and vix["is_fearful"]:
+                    msg += f"  → 🔥 **HIGHLY RECOMMENDED** - VIX is {vix['level']:.0f}, market fearful, strong buy signal!\n"
+                else:
+                    msg += "  → Consider buying the dip\n"
         else:
             msg += "🟢 **BUYING OPPORTUNITIES:** None right now\n"
         
@@ -433,8 +489,9 @@ def send_market_report():
         logger.info("📊 Fetching market data...")
         portfolio = get_portfolio_data()
         market = get_market_metrics()
+        vix = get_vix_sentiment()
         
-        message = format_market_report(portfolio, market)
+        message = format_market_report(portfolio, market, vix)
         
         logger.info("📤 Sending market report...")
         asyncio.run(_send_telegram(message))
@@ -447,7 +504,8 @@ def send_signal_report():
     """Send technical signals (buy/sell opportunities)"""
     try:
         logger.info("🔍 Analyzing technical signals...")
-        message = format_signal_report()
+        vix = get_vix_sentiment()
+        message = format_signal_report(vix)
         
         logger.info("📤 Sending signal report...")
         asyncio.run(_send_telegram(message))
