@@ -23,7 +23,7 @@ load_dotenv()
 # CONFIGURATION
 # ============================================================================
 
-# Your Holdings (core positions)
+# Your Holdings (all positions)
 HOLDINGS = {
     "RKLB": {"shares": 62, "avg_cost": 68.152},
     "NVDA": {"shares": 10, "avg_cost": 175.90},
@@ -31,6 +31,10 @@ HOLDINGS = {
     "ALAB": {"shares": 3, "avg_cost": 116.00},
     "SCHD": {"shares": 15, "avg_cost": 30.50},
     "INTC": {"shares": 4, "avg_cost": 51.33},
+    "NBIS": {"shares": 5, "avg_cost": 114.90},
+    "NVDL": {"shares": 10, "avg_cost": 80.90},
+    "SLV": {"shares": 18, "avg_cost": 90.667},
+    "GRAB": {"shares": 284, "avg_cost": 5.899},
 }
 
 MARKET_TICKERS = ["SPY", "QQQ"]
