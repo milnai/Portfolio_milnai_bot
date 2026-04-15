@@ -85,14 +85,18 @@ def get_stock_data(ticker):
                 # Current quote
                 url = f"{FINNHUB_BASE_URL}/quote"
                 params = {"symbol": ticker, "token": FINNHUB_API_KEY}
+                logger.info(f"   🌐 Fetching {ticker} from Finnhub...")
                 response = requests.get(url, params=params, timeout=10)
+                logger.info(f"   ✅ HTTP {response.status_code}")
                 
                 if response.status_code != 200:
                     raise Exception(f"HTTP {response.status_code}")
                 
                 data = response.json()
+                logger.info(f"   📊 Data: {data}")
                 
                 if "c" not in data or data["c"] is None or data["c"] == 0:
+                    logger.warning(f"   ⚠️ No valid price for {ticker}")
                     return None
                 
                 current_price = float(data["c"])
@@ -130,11 +134,14 @@ def get_stock_data(ticker):
                 
             except Exception as e:
                 if attempt < max_retries - 1:
+                    logger.warning(f"   ⚠️ Retry {attempt + 1}/{max_retries}: {str(e)[:50]}")
                     time.sleep(2 ** attempt)
                 else:
+                    logger.error(f"   ❌ Failed after {max_retries} retries: {str(e)[:100]}")
                     return None
     
     except Exception as e:
+        logger.error(f"❌ Exception in get_stock_data({ticker}): {str(e)[:100]}")
         return None
 
 
@@ -142,8 +149,10 @@ def get_vix_sentiment():
     """Get VIX level and sentiment"""
     try:
         if not FINNHUB_API_KEY:
+            logger.warning("⚠️ VIX: FINNHUB_API_KEY not set")
             return None
         
+        logger.info("📊 Fetching VIX...")
         url = f"{FINNHUB_BASE_URL}/quote"
         params = {"symbol": "^VIX", "token": FINNHUB_API_KEY}
         response = requests.get(url, params=params, timeout=10)
@@ -152,6 +161,7 @@ def get_vix_sentiment():
             data = response.json()
             if "c" in data and data["c"]:
                 vix = float(data["c"])
+                logger.info(f"   ✅ VIX: {vix:.2f}")
                 
                 if vix < 15:
                     sentiment = "😌 **Calm & Confident** - Investors relaxed"
@@ -175,8 +185,12 @@ def get_vix_sentiment():
                     "emoji": emoji,
                     "is_fearful": vix > 25,
                 }
-    except:
-        pass
+            else:
+                logger.warning("   ⚠️ VIX: No price data")
+        else:
+            logger.warning(f"   ⚠️ VIX: HTTP {response.status_code}")
+    except Exception as e:
+        logger.warning(f"   ⚠️ VIX error: {str(e)[:50]}")
     
     return None
 
@@ -508,8 +522,12 @@ def get_portfolio_data():
         total_value = 0
         positions = {}
         
+        logger.info(f"🔍 Starting portfolio analysis...")
+        
         for ticker, info in HOLDINGS.items():
+            logger.info(f"📍 Fetching {ticker}...")
             data = get_stock_data(ticker)
+            logger.info(f"   Result: {data}")
             if data:
                 current_price = data["current_price"]
                 shares = info["shares"]
@@ -532,6 +550,8 @@ def get_portfolio_data():
         total_pnl = total_value - total_cost
         total_pnl_pct = (total_pnl / total_cost * 100) if total_cost > 0 else 0
         
+        logger.info(f"📈 Portfolio Summary: {len(positions)}/10 stocks fetched | Total value: ${total_value:,.0f} | P&L: ${total_pnl:,.0f}")
+        
         return {
             "positions": positions,
             "total_value": total_value,
@@ -547,15 +567,22 @@ def get_market_metrics():
     """Get market indices"""
     try:
         metrics = {}
+        logger.info(f"📊 Fetching market indices (SPY, QQQ)...")
         for ticker in MARKET_TICKERS:
+            logger.info(f"   Fetching {ticker}...")
             data = get_stock_data(ticker)
             if data:
                 metrics[ticker] = {
                     "current": data["current_price"],
                     "daily_pct": data["daily_change_pct"],
                 }
+                logger.info(f"   ✅ {ticker} success")
+            else:
+                logger.warning(f"   ❌ {ticker} failed")
+        logger.info(f"📈 Market metrics: {len(metrics)}/2 fetched")
         return metrics if metrics else None
-    except:
+    except Exception as e:
+        logger.error(f"❌ Error in get_market_metrics: {e}")
         return None
 
 
@@ -568,10 +595,16 @@ def send_market_report():
     try:
         logger.info("📊 Fetching market data...")
         portfolio = get_portfolio_data()
+        logger.info(f"   Portfolio result: {len(portfolio.get('positions', {}))} positions")
+        
         market = get_market_metrics()
+        logger.info(f"   Market result: {len(market) if market else 0} metrics")
+        
         vix = get_vix_sentiment()
+        logger.info(f"   VIX result: {vix['level']:.2f if vix else 'N/A'}")
         
         message = format_market_report(portfolio, market, vix)
+        logger.info(f"   Message length: {len(message)} chars")
         
         logger.info("📤 Sending market report...")
         asyncio.run(_send_telegram(message))
