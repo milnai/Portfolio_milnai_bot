@@ -459,7 +459,7 @@ def format_trading_signals(vix):
         msg += f"__{times['sgt']} (SGT) | {times['est']} (EST)__\n\n"
         
         if vix:
-            msg += f"{vix['emoji']} **VIX: {vix['level']:.2f}}** - {vix['sentiment']}\n\n"
+            msg += f"{vix['emoji']} **VIX: {vix['level']:.2f}** - {vix['sentiment']}\n\n"
         
         buy_orders = []
         sell_orders = []
