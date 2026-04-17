@@ -147,10 +147,10 @@ def get_stock_data(ticker):
     try:
         stock = yf.Ticker(ticker)
 
-        # --- Live quote ---
+        # --- Live quote (fast_info is an object, not a dict) ---
         info          = stock.fast_info
-        current_price = info.get("last_price") or info.get("regularMarketPrice")
-        prev_close    = info.get("previous_close") or info.get("regularMarketPreviousClose")
+        current_price = getattr(info, "last_price", None) or getattr(info, "regular_market_price", None)
+        prev_close    = getattr(info, "previous_close", None) or getattr(info, "regular_market_previous_close", None)
 
         if not current_price or float(current_price) == 0:
             logger.warning(f"No price from yfinance for {ticker}")
@@ -169,7 +169,7 @@ def get_stock_data(ticker):
             return None
 
         # Flatten MultiIndex columns if present
-        if isinstance(hist.columns, type(hist.columns)) and hasattr(hist.columns, "levels"):
+        if hasattr(hist.columns, "levels"):
             hist.columns = hist.columns.get_level_values(0)
 
         return {
@@ -203,7 +203,8 @@ def validate_price(ticker, price):
 def get_vix():
     """Fetch VIX from yfinance and classify market sentiment."""
     try:
-        vix = yf.Ticker("^VIX").fast_info.get("last_price")
+        info = yf.Ticker("^VIX").fast_info
+        vix  = getattr(info, "last_price", None) or getattr(info, "regular_market_price", None)
         if not vix:
             return None
         vix = float(vix)
