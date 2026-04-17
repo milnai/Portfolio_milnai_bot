@@ -22,6 +22,30 @@ SCHEDULE (all EST, Mon-Fri only):
   Post-market : Trading signals at 4:00pm & 4:30pm | Option Hunter at 4:15pm
 """
 
+import subprocess
+import sys
+
+# Auto-install missing packages (Railway/Docker safety net)
+_REQUIRED = [
+    "yfinance",
+    "requests",
+    "numpy",
+    "APScheduler",
+    "python-telegram-bot",
+    "python-dotenv",
+    "pytz",
+]
+
+def _ensure_packages():
+    for pkg in _REQUIRED:
+        try:
+            __import__(pkg.lower().replace("-", "_"))
+        except ImportError:
+            print(f"[setup] Installing missing package: {pkg}")
+            subprocess.check_call([sys.executable, "-m", "pip", "install", pkg, "--quiet"])
+
+_ensure_packages()
+
 import asyncio
 import os
 import logging
@@ -31,7 +55,7 @@ import numpy as np
 import yfinance as yf
 import requests
 
-from datetime import datetime, timedelta
+from datetime import datetime
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from telegram import Bot
@@ -43,8 +67,6 @@ load_dotenv()
 # CONFIGURATION
 # ============================================================================
 
-POLYGON_API_KEY = os.getenv("POLYGON_API_KEY")
-POLYGON_BASE    = "https://api.polygon.io"
 TELEGRAM_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT   = int(os.getenv("TELEGRAM_CHAT_ID", "0"))
 
@@ -114,129 +136,64 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================================
-# POLYGON DATA LAYER
+# DATA LAYER (yfinance — free, no API key, no rate limits)
 # ============================================================================
-
-def _polygon_get(endpoint, params=None):
-    """Base Polygon API call with retry + backoff."""
-    if params is None:
-        params = {}
-    params["apiKey"] = POLYGON_API_KEY
-
-    for attempt in range(3):
-        try:
-            r = requests.get(f"{POLYGON_BASE}{endpoint}", params=params, timeout=10)
-            if r.status_code == 200:
-                return r.json()
-            elif r.status_code == 429:
-                logger.warning("Polygon rate limited — sleeping 5s")
-                time.sleep(5)
-            else:
-                logger.warning(f"Polygon HTTP {r.status_code} on {endpoint}")
-                return None
-        except Exception as e:
-            logger.warning(f"Polygon attempt {attempt+1} error: {e}")
-            if attempt < 2:
-                time.sleep(2 ** attempt)
-    return None
-
-
-def get_polygon_quote(ticker):
-    """Last trade price + daily change from Polygon snapshot."""
-    try:
-        data = _polygon_get(f"/v2/snapshot/locale/us/markets/stocks/tickers/{ticker}")
-        if not data or data.get("status") not in ("OK", "DELAYED"):
-            return None
-
-        t = data.get("ticker", {})
-        price = (
-            t.get("lastTrade", {}).get("p") or
-            t.get("min", {}).get("c") or
-            t.get("day", {}).get("c")
-        )
-        prev = t.get("prevDay", {}).get("c", price)
-
-        if not price or float(price) == 0:
-            logger.warning(f"No price from Polygon for {ticker}")
-            return None
-
-        price = float(price)
-        prev  = float(prev)
-        return {
-            "price":      price,
-            "prev_close": prev,
-            "daily_chg":  price - prev,
-            "daily_pct":  ((price - prev) / prev * 100) if prev else 0,
-        }
-    except Exception as e:
-        logger.error(f"Polygon quote {ticker}: {e}")
-        return None
-
-
-def get_polygon_candles(ticker, days=90):
-    """Daily OHLCV from Polygon (fixed: uses from/to dates, not count)."""
-    try:
-        from_dt = (datetime.now() - timedelta(days=days + 30)).strftime("%Y-%m-%d")
-        to_dt   = datetime.now().strftime("%Y-%m-%d")
-        data = _polygon_get(
-            f"/v2/aggs/ticker/{ticker}/range/1/day/{from_dt}/{to_dt}",
-            {"adjusted": "true", "sort": "asc", "limit": 200}
-        )
-        if not data or not data.get("results"):
-            logger.warning(f"No candle data from Polygon for {ticker}")
-            return None
-
-        res = data["results"]
-        return {
-            "closes":  [r["c"] for r in res],
-            "highs":   [r["h"] for r in res],
-            "lows":    [r["l"] for r in res],
-            "volumes": [r["v"] for r in res],
-        }
-    except Exception as e:
-        logger.error(f"Polygon candles {ticker}: {e}")
-        return None
-
 
 def get_stock_data(ticker):
-    """Combined quote + candles for one ticker (2 Polygon calls total)."""
-    quote = get_polygon_quote(ticker)
-    if not quote:
-        return None
-    candles = get_polygon_candles(ticker)
-    if not candles:
-        return None
-    return {
-        "ticker":          ticker,
-        "current_price":   quote["price"],
-        "prev_close":      quote["prev_close"],
-        "daily_change":    quote["daily_chg"],
-        "daily_change_pct":quote["daily_pct"],
-        **candles,
-    }
-
-
-# ============================================================================
-# DUAL-SOURCE PRICE VALIDATOR
-# ============================================================================
-
-def validate_price(ticker, polygon_price):
     """
-    Cross-checks Polygon price against yfinance.
-    Returns (is_valid, yf_price, diff_pct).
-    Blocks option alerts if difference > 0.5%.
+    Fetch live quote + 6-month OHLCV history using yfinance.
+    Single source — free tier, no API key required.
     """
     try:
-        info = yf.Ticker(ticker).fast_info
-        yf_price = info.get("last_price") or info.get("regularMarketPrice")
-        if not yf_price:
-            return True, None, 0.0  # Can't validate — fail open
+        stock = yf.Ticker(ticker)
 
-        diff_pct = abs(polygon_price - yf_price) / polygon_price * 100
-        return diff_pct <= 0.5, float(yf_price), round(diff_pct, 3)
+        # --- Live quote ---
+        info          = stock.fast_info
+        current_price = info.get("last_price") or info.get("regularMarketPrice")
+        prev_close    = info.get("previous_close") or info.get("regularMarketPreviousClose")
+
+        if not current_price or float(current_price) == 0:
+            logger.warning(f"No price from yfinance for {ticker}")
+            return None
+
+        current_price = float(current_price)
+        prev_close    = float(prev_close) if prev_close else current_price
+        daily_change  = current_price - prev_close
+        daily_pct     = (daily_change / prev_close * 100) if prev_close else 0
+
+        # --- Historical OHLCV (6 months for indicators) ---
+        hist = yf.download(ticker, period="6mo", interval="1d",
+                           progress=False, auto_adjust=True)
+        if hist.empty:
+            logger.warning(f"No historical data from yfinance for {ticker}")
+            return None
+
+        # Flatten MultiIndex columns if present
+        if isinstance(hist.columns, type(hist.columns)) and hasattr(hist.columns, "levels"):
+            hist.columns = hist.columns.get_level_values(0)
+
+        return {
+            "ticker":           ticker,
+            "current_price":    current_price,
+            "prev_close":       prev_close,
+            "daily_change":     daily_change,
+            "daily_change_pct": daily_pct,
+            "closes":           [float(x) for x in hist["Close"].dropna().tolist()],
+            "highs":            [float(x) for x in hist["High"].dropna().tolist()],
+            "lows":             [float(x) for x in hist["Low"].dropna().tolist()],
+            "volumes":          [float(x) for x in hist["Volume"].dropna().tolist()],
+        }
     except Exception as e:
-        logger.warning(f"Price validate {ticker}: {e}")
-        return True, None, 0.0
+        logger.error(f"get_stock_data {ticker}: {e}")
+        return None
+
+
+def validate_price(ticker, price):
+    """
+    Now that yfinance is the single source, validation is a no-op.
+    Kept for compatibility — always returns valid with the same price.
+    """
+    return True, price, 0.0
 
 
 # ============================================================================
@@ -914,9 +871,6 @@ def job_option_hunter():
 # ============================================================================
 
 def main():
-    if not POLYGON_API_KEY:
-        logger.error("❌ POLYGON_API_KEY not set in .env — exiting")
-        return
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT:
         logger.error("❌ TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not set — exiting")
         return
@@ -953,10 +907,9 @@ def main():
     scheduler.start()
     logger.info("=" * 55)
     logger.info("✅ Trading Bot v2.0 + Option Hunter LIVE")
-    logger.info("   Data: Polygon.io (candles + quotes)")
-    logger.info("   VIX:  yfinance (single call)")
-    logger.info("   Options chain: yfinance")
-    logger.info("   Price validation: Polygon × yfinance cross-check")
+    logger.info("   Data: yfinance (quotes + candles + options)")
+    logger.info("   VIX:  yfinance ^VIX")
+    logger.info("   Price source: single yfinance (free tier)")
     logger.info("=" * 55)
 
     try:
