@@ -89,29 +89,54 @@ HOLDINGS = {
 
 MARKET_TICKERS = ["SPY", "QQQ"]
 
-# --- Option Hunter scan universe (55 liquid, optionable tickers) ---
+# --- Option Hunter scan universe (expanded from watchlist — 75 tickers) ---
 OPTION_HUNT_TICKERS = [
     # Broad ETFs
-    "SPY", "QQQ", "IWM",
+    "SPY", "QQQ", "IWM", "GLD", "SLV",
     # Mega-cap tech
     "AAPL", "MSFT", "NVDA", "META", "AMZN", "GOOGL", "TSLA",
     # High-beta movers
     "AMD", "CRWD", "PLTR", "COIN", "MSTR", "SNOW", "SOFI",
     # Semiconductors
-    "TSM", "AMAT", "MU", "AVGO", "QCOM", "ARM",
+    "TSM", "AMAT", "MU", "AVGO", "QCOM", "ARM", "MRVL",
     # Financials
     "JPM", "GS", "BAC", "MS", "C",
     # Healthcare
-    "UNH", "JNJ", "PFE", "MRNA",
+    "UNH", "JNJ", "PFE", "MRNA", "HIMS",
     # Energy
-    "XOM", "CVX",
+    "XOM", "CVX", "SCCO",
     # Consumer / media
     "NFLX", "DIS", "SBUX", "NKE",
     # Fintech / growth
     "PYPL", "SQ", "UBER", "ABNB", "SHOP",
+    # AI infrastructure (added after CRWV/NBIS miss)
+    "CRWV", "NBIS", "APLD",
+    # Watchlist additions (Ian's full list)
+    "AXON", "PANW", "BABA", "ZIM", "HIVE",
     # Ian's holdings (optionable)
-    "RKLB", "ALAB", "GRAB", "NVDL", "IREN",
+    "RKLB", "ALAB", "GRAB", "NVDL", "IREN", "SCHD",
 ]
+
+# --- Earnings watch: these trigger pre-earnings PUT alerts ---
+# Format: "TICKER": "YYYY-MM-DD" (expected earnings date)
+# Update weekly — bot will warn 1-2 days before
+EARNINGS_CALENDAR = {
+    "PLTR": "2026-05-04",
+    "RKLB": "2026-05-13",
+    "AMD":  "2026-05-05",
+    "NVDA": "2026-05-28",
+    "AXON": "2026-05-06",
+    "CRWV": "2026-05-14",
+    "NBIS": "2026-05-12",
+    "HIMS": "2026-05-05",
+    "TSLA": "2026-07-22",
+    "NFLX": "2026-07-16",
+    "META": "2026-04-30",
+    "AMZN": "2026-05-01",
+    "AAPL": "2026-05-01",
+    "MSFT": "2026-04-30",
+    "GOOGL":"2026-04-29",
+}
 
 # --- Signal thresholds (per strategy doc) ---
 BUY_STRONG  =  5
@@ -230,6 +255,87 @@ def get_vix():
     except Exception as e:
         logger.error(f"VIX error: {e}")
         return None
+
+
+# ============================================================================
+# EARNINGS ALERT ENGINE
+# ============================================================================
+
+def check_earnings_alerts():
+    """
+    Scans EARNINGS_CALENDAR for stocks reporting in 1-2 days.
+    Returns list of earnings alerts with PUT/CALL bias based on recent trend.
+    Fires pre-market so you can position BEFORE the move.
+    """
+    alerts = []
+    today  = datetime.now(EST).date()
+
+    for ticker, date_str in EARNINGS_CALENDAR.items():
+        try:
+            earn_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+            days_away = (earn_date - today).days
+
+            if days_away < 0 or days_away > 2:
+                continue  # Already passed or too far out
+
+            # Get recent price trend for bias
+            data = get_stock_data(ticker)
+            trend = "neutral"
+            score = 0
+            if data:
+                scored = score_ticker(data)
+                if scored:
+                    score = scored["score"]
+                    if score >= 2:
+                        trend = "bullish"
+                    elif score <= -2:
+                        trend = "bearish"
+
+            # Bias logic for earnings plays
+            if trend == "bearish":
+                bias = "🔴 PUT candidate"
+                reason = "Bearish indicators into earnings — consider protective put"
+            elif trend == "bullish":
+                bias = "🟢 CALL candidate"
+                reason = "Bullish momentum into earnings — consider call if IV not too high"
+            else:
+                bias = "⚪ NEUTRAL — high risk"
+                reason = "Mixed signals — avoid options, earnings binary event"
+
+            alerts.append({
+                "ticker":    ticker,
+                "earn_date": date_str,
+                "days_away": days_away,
+                "bias":      bias,
+                "reason":    reason,
+                "score":     score,
+            })
+        except Exception as e:
+            logger.warning(f"Earnings check {ticker}: {e}")
+
+    return alerts
+
+
+def format_earnings_alerts(alerts):
+    """Format earnings alert message for Telegram."""
+    if not alerts:
+        return None
+
+    t   = _time_display()
+    msg = "📅 *EARNINGS ALERT — OPTIONS WATCH*\n"
+    msg += f"_{t['sgt']} | {t['est']}_\n\n"
+    msg += "⚡ *Stocks reporting in 1-2 days — act BEFORE open:*\n\n"
+
+    for a in alerts:
+        day_label = "TODAY after close" if a["days_away"] == 0 else (
+                    "TOMORROW" if a["days_away"] == 1 else "In 2 days")
+        msg += f"{a['bias']}: *{a['ticker']}*\n"
+        msg += f"Earnings: {a['earn_date']} ({day_label})\n"
+        msg += f"Tech score: {a['score']:+d}/6 | {a['reason']}\n"
+        msg += f"⚠️ IV will spike at open — buy options NOW, not after report\n\n"
+
+    msg += "_Earnings = binary risk. Max 1% capital per trade. Exit before close on earnings day._"
+    return msg
 
 
 # ============================================================================
@@ -796,10 +902,10 @@ def format_option_hunter(opportunities, vix):
 
             msg += f"{label}: *{opp['ticker']}*\n"
             msg += f"Stock: ${opp['price']:.2f} | Signal score: {opp['score']:+d}/6\n"
+            msg += f"Entry trigger: Only buy if stock ≤ ${opp['price']*1.005:.2f} (within 0.5% of now)\n"
             msg += f"Contract: ${opt['strike']:.0f} {opt['direction']} | Exp: {opt['expiry']} ({opt['dte']} DTE)\n"
             msg += f"Premium: ~${opt['mid']:.2f}/contract | Max risk: ${max_risk:.0f}\n"
             msg += f"Target: ${opt['mid']*2:.2f} (2× = +${target_pnl:.0f}) | OI: {opt['oi']:,} | IV: {opt['iv']:.0f}%\n"
-            msg += f"{val}\n"
             msg += "Top signals:\n"
             for d in opp["details"][:4]:
                 msg += f"  {d}\n"
@@ -856,6 +962,20 @@ def job_trading_signals():
         logger.error(f"job_trading_signals: {e}")
 
 
+def job_earnings_alert():
+    logger.info("📅 Checking earnings alerts...")
+    try:
+        alerts = check_earnings_alerts()
+        msg    = format_earnings_alerts(alerts)
+        if msg:
+            send_telegram(msg)
+            logger.info(f"✅ Earnings alert sent ({len(alerts)} stock(s))")
+        else:
+            logger.info("✅ No upcoming earnings in 1-2 days")
+    except Exception as e:
+        logger.error(f"job_earnings_alert: {e}")
+
+
 def job_option_hunter():
     logger.info("🎯 Sending Option Hunter...")
     try:
@@ -887,6 +1007,11 @@ def main():
         hour=8, minute=30, day_of_week="mon-fri"),
         id="pre_market_options", name="Pre-Market Option Hunt")
 
+    # Earnings alert — fires at 7am ET every trading day
+    scheduler.add_job(job_earnings_alert, CronTrigger(
+        hour=7, minute=0, day_of_week="mon-fri"),
+        id="earnings_alert", name="Earnings Alert")
+
     # --- Market hours (9:30 AM – 3:30 PM ET) ---
     scheduler.add_job(job_market_report, CronTrigger(
         hour="9-15", minute=30, day_of_week="mon-fri"),
@@ -907,10 +1032,11 @@ def main():
 
     scheduler.start()
     logger.info("=" * 55)
-    logger.info("✅ Trading Bot v2.0 + Option Hunter LIVE")
+    logger.info("✅ Trading Bot v2.1 + Option Hunter LIVE")
+    logger.info(f"  Scanning {len(OPTION_HUNT_TICKERS)} tickers for options")
+    logger.info(f"  Watching {len(EARNINGS_CALENDAR)} stocks for earnings alerts")
     logger.info("   Data: yfinance (quotes + candles + options)")
-    logger.info("   VIX:  yfinance ^VIX")
-    logger.info("   Price source: single yfinance (free tier)")
+    logger.info("   Earnings: 7am ET daily pre-earnings PUT/CALL alert")
     logger.info("=" * 55)
 
     try:
