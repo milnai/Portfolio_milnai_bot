@@ -73,9 +73,9 @@ TELEGRAM_CHAT   = int(os.getenv("TELEGRAM_CHAT_ID", "0"))
 EST = pytz.timezone("US/Eastern")
 SGT = pytz.timezone("Asia/Singapore")
 
-# --- Holdings (updated Apr 2026: INTC sold, IREN added) ---
+# --- Holdings (updated Apr 18 2026: RKLB 67 shares, APLD added) ---
 HOLDINGS = {
-    "RKLB": {"shares": 62,  "avg_cost": 68.152},
+    "RKLB": {"shares": 67,  "avg_cost": 68.439},
     "NVDA": {"shares": 10,  "avg_cost": 175.90},
     "MSFT": {"shares": 2,   "avg_cost": 372.50},
     "ALAB": {"shares": 3,   "avg_cost": 116.00},
@@ -85,6 +85,7 @@ HOLDINGS = {
     "SLV":  {"shares": 18,  "avg_cost": 90.667},
     "GRAB": {"shares": 284, "avg_cost": 5.899},
     "IREN": {"shares": 5,   "avg_cost": 47.00},
+    "APLD": {"shares": 10,  "avg_cost": 31.40},
 }
 
 MARKET_TICKERS = ["SPY", "QQQ"]
