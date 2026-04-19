@@ -74,18 +74,44 @@ EST = pytz.timezone("US/Eastern")
 SGT = pytz.timezone("Asia/Singapore")
 
 # --- Holdings (updated Apr 18 2026: RKLB 67 shares, APLD added) ---
-HOLDINGS = {
-    "RKLB": {"shares": 67,  "avg_cost": 68.439},
-    "NVDA": {"shares": 10,  "avg_cost": 175.90},
-    "MSFT": {"shares": 2,   "avg_cost": 372.50},
-    "ALAB": {"shares": 3,   "avg_cost": 116.00},
-    "SCHD": {"shares": 15,  "avg_cost": 30.50},
-    "NBIS": {"shares": 5,   "avg_cost": 114.90},
-    "NVDL": {"shares": 10,  "avg_cost": 80.90},
-    "SLV":  {"shares": 18,  "avg_cost": 90.667},
-    "GRAB": {"shares": 284, "avg_cost": 5.899},
-    "IREN": {"shares": 5,   "avg_cost": 47.00},
-    "APLD": {"shares": 10,  "avg_cost": 31.40},
+PORTFOLIO = {
+    # ── STOCKS ──────────────────────────────
+    "RKLB": {"shares": 67,  "avg_cost": 68.439, "type": "stock"},
+    "NVDA": {"shares": 10,  "avg_cost": 175.90, "type": "stock"},
+    "NBIS": {"shares": 5,   "avg_cost": 114.90, "type": "stock"},
+    "ALAB": {"shares": 3,   "avg_cost": 116.00, "type": "stock"},
+    "NVDL": {"shares": 10,  "avg_cost": 80.90,  "type": "stock"},
+    "MSFT": {"shares": 2,   "avg_cost": 372.50, "type": "stock"},
+    "SCHD": {"shares": 15,  "avg_cost": 30.50,  "type": "stock"},
+    "APLD": {"shares": 10,  "avg_cost": 31.40,  "type": "stock"},
+    "SLV":  {"shares": 18,  "avg_cost": 90.667, "type": "stock"},
+    "GRAB": {"shares": 284, "avg_cost": 5.899,  "type": "stock"},
+
+    # ── OPTIONS ─────────────────────────────
+    "NVDA_CALL_260618_200": {
+        "contracts": 1,
+        "avg_cost": 12.00,
+        "strike": 200,
+        "expiry": "2026-06-18",
+        "type": "call_option",
+        "ticker": "NVDA"
+    },
+    "NVDA_CALL_260508_205": {
+        "contracts": 2,
+        "avg_cost": 4.85,
+        "strike": 205,
+        "expiry": "2026-05-08",
+        "type": "call_option",
+        "ticker": "NVDA"
+    },
+    "TSM_CALL_260618_380": {
+        "contracts": 1,
+        "avg_cost": 19.00,
+        "strike": 380,
+        "expiry": "2026-06-18",
+        "type": "call_option",
+        "ticker": "TSM"
+    },
 }
 
 MARKET_TICKERS = ["SPY", "QQQ"]
