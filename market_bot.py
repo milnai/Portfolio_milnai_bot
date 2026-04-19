@@ -51,6 +51,7 @@ import os
 import logging
 import time
 import pytz
+import json
 import numpy as np
 import yfinance as yf
 import requests
@@ -58,7 +59,8 @@ import requests
 from datetime import datetime
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
-from telegram import Bot
+from telegram import Bot, Update
+from telegram.ext import Application, CommandHandler, ContextTypes
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -89,6 +91,41 @@ HOLDINGS = {
 }
 
 MARKET_TICKERS = ["SPY", "QQQ"]
+
+# ============================================================================
+# PORTFOLIO PERSISTENCE
+# ============================================================================
+# Holdings are saved to portfolio.json so updates via Telegram survive restarts.
+# On first run, loads from hardcoded HOLDINGS above as the default.
+
+PORTFOLIO_FILE = "portfolio.json"
+
+def load_portfolio():
+    """Load portfolio from JSON file. Falls back to hardcoded HOLDINGS if missing."""
+    try:
+        if os.path.exists(PORTFOLIO_FILE):
+            with open(PORTFOLIO_FILE, "r") as f:
+                data = json.load(f)
+                logger.info(f"✅ Portfolio loaded from {PORTFOLIO_FILE} ({len(data)} positions)")
+                return data
+    except Exception as e:
+        logger.warning(f"Could not load portfolio.json: {e}")
+    logger.info("📋 Using hardcoded HOLDINGS as default portfolio")
+    return {k: dict(v) for k, v in HOLDINGS.items()}
+
+
+def save_portfolio(portfolio):
+    """Save current portfolio to JSON file."""
+    try:
+        with open(PORTFOLIO_FILE, "w") as f:
+            json.dump(portfolio, f, indent=2)
+        logger.info(f"💾 Portfolio saved ({len(portfolio)} positions)")
+    except Exception as e:
+        logger.error(f"Could not save portfolio: {e}")
+
+
+# Live portfolio — loaded on startup, updated via Telegram commands
+live_portfolio = load_portfolio()
 
 # --- Option Hunter scan universe (expanded from watchlist — 75 tickers) ---
 OPTION_HUNT_TICKERS = [
@@ -735,7 +772,7 @@ def get_portfolio_data():
     total_cost = total_value = 0
     positions  = {}
 
-    for ticker, info in HOLDINGS.items():
+    for ticker, info in live_portfolio.items():
         data = get_stock_data(ticker)
         if not data:
             continue
@@ -1198,7 +1235,14 @@ async def _send(message):
 
 
 def send_telegram(message):
-    asyncio.run(_send(message))
+    """Send message from scheduler (background thread) safely."""
+    try:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(_send(message))
+        loop.close()
+    except Exception as e:
+        logger.error(f"send_telegram error: {e}")
 
 
 # ============================================================================
@@ -1264,6 +1308,230 @@ def job_option_hunter():
 
 
 # ============================================================================
+# TELEGRAM COMMAND HANDLERS
+# ============================================================================
+
+def _format_portfolio_summary():
+    """Returns a formatted portfolio summary string using live prices."""
+    total_cost = total_value = 0
+    lines = []
+    for ticker, info in live_portfolio.items():
+        try:
+            data  = get_stock_data(ticker)
+            price = data["current_price"] if data else None
+            if not price:
+                lines.append(f"⚪ {ticker}: price unavailable")
+                continue
+            shares   = info["shares"]
+            avg_cost = info["avg_cost"]
+            cost     = shares * avg_cost
+            value    = shares * price
+            pnl      = value - cost
+            pnl_pct  = (pnl / cost * 100) if cost > 0 else 0
+            total_cost  += cost
+            total_value += value
+            emoji = "🟢" if pnl >= 0 else "🔴"
+            lines.append(
+                f"{emoji} *{ticker}*: {shares} shares @ ${avg_cost:.2f} avg\n"
+                f"   Now: ${price:.2f} | P&L: ${pnl:+.0f} ({pnl_pct:+.1f}%)"
+            )
+        except Exception as e:
+            lines.append(f"⚪ {ticker}: error ({e})")
+
+    total_pnl     = total_value - total_cost
+    total_pnl_pct = (total_pnl / total_cost * 100) if total_cost > 0 else 0
+    emoji         = "🟢" if total_pnl >= 0 else "🔴"
+
+    msg  = "💼 *CURRENT PORTFOLIO*\n\n"
+    msg += "\n".join(lines)
+    msg += f"\n\n{'='*30}\n"
+    msg += f"{emoji} *TOTAL P&L: ${total_pnl:+.0f} ({total_pnl_pct:+.1f}%)*\n"
+    msg += f"Value: ${total_value:,.0f} | Cost: ${total_cost:,.0f}"
+    return msg
+
+
+async def cmd_buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /buy TICKER SHARES PRICE
+    Example: /buy NVDA 10 201.50
+    Adds or updates a position with weighted average cost.
+    """
+    try:
+        if len(context.args) != 3:
+            await update.message.reply_text(
+                "❌ Usage: /buy TICKER SHARES PRICE\nExample: /buy NVDA 10 201.50"
+            )
+            return
+
+        ticker = context.args[0].upper()
+        shares = float(context.args[1])
+        price  = float(context.args[2])
+
+        if shares <= 0 or price <= 0:
+            await update.message.reply_text("❌ Shares and price must be positive numbers.")
+            return
+
+        if ticker in live_portfolio:
+            # Recalculate weighted average cost
+            old_shares   = live_portfolio[ticker]["shares"]
+            old_avg      = live_portfolio[ticker]["avg_cost"]
+            new_shares   = old_shares + shares
+            new_avg      = ((old_shares * old_avg) + (shares * price)) / new_shares
+            live_portfolio[ticker]["shares"]   = new_shares
+            live_portfolio[ticker]["avg_cost"] = round(new_avg, 3)
+            action = f"Added to existing position\nNew avg cost: ${new_avg:.3f}"
+        else:
+            live_portfolio[ticker] = {"shares": shares, "avg_cost": price}
+            action = "New position opened"
+
+        save_portfolio(live_portfolio)
+
+        msg  = f"✅ *BOUGHT: {shares:.0f} {ticker} @ ${price:.2f}*\n"
+        msg += f"{action}\n"
+        msg += f"Total shares: {live_portfolio[ticker]['shares']:.0f}\n"
+        msg += f"Avg cost: ${live_portfolio[ticker]['avg_cost']:.3f}\n"
+        msg += f"Position value: ${live_portfolio[ticker]['shares'] * price:,.0f}"
+        await update.message.reply_text(msg, parse_mode="Markdown")
+
+    except ValueError:
+        await update.message.reply_text("❌ Invalid input. Example: /buy NVDA 10 201.50")
+    except Exception as e:
+        logger.error(f"cmd_buy error: {e}")
+        await update.message.reply_text(f"❌ Error: {e}")
+
+
+async def cmd_sell(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /sell TICKER SHARES PRICE
+    Example: /sell RKLB 20 85.00
+    Reduces position and calculates realised P&L.
+    """
+    try:
+        if len(context.args) != 3:
+            await update.message.reply_text(
+                "❌ Usage: /sell TICKER SHARES PRICE\nExample: /sell RKLB 20 85.00"
+            )
+            return
+
+        ticker     = context.args[0].upper()
+        sell_shares = float(context.args[1])
+        sell_price  = float(context.args[2])
+
+        if ticker not in live_portfolio:
+            await update.message.reply_text(
+                f"❌ {ticker} not found in portfolio. Use /portfolio to see holdings."
+            )
+            return
+
+        held   = live_portfolio[ticker]["shares"]
+        avg    = live_portfolio[ticker]["avg_cost"]
+
+        if sell_shares > held:
+            await update.message.reply_text(
+                f"❌ You only hold {held:.0f} shares of {ticker}. Cannot sell {sell_shares:.0f}."
+            )
+            return
+
+        # Calculate realised P&L
+        pnl     = (sell_price - avg) * sell_shares
+        pnl_pct = ((sell_price - avg) / avg * 100) if avg > 0 else 0
+
+        remaining = held - sell_shares
+        if remaining <= 0:
+            del live_portfolio[ticker]
+            position_note = "Position fully closed."
+        else:
+            live_portfolio[ticker]["shares"] = remaining
+            position_note = f"Remaining: {remaining:.0f} shares @ ${avg:.3f} avg"
+
+        save_portfolio(live_portfolio)
+
+        emoji = "🟢" if pnl >= 0 else "🔴"
+        msg  = f"✅ *SOLD: {sell_shares:.0f} {ticker} @ ${sell_price:.2f}*\n"
+        msg += f"{emoji} Realised P&L: ${pnl:+.0f} ({pnl_pct:+.1f}%)\n"
+        msg += f"{position_note}"
+        await update.message.reply_text(msg, parse_mode="Markdown")
+
+    except ValueError:
+        await update.message.reply_text("❌ Invalid input. Example: /sell RKLB 20 85.00")
+    except Exception as e:
+        logger.error(f"cmd_sell error: {e}")
+        await update.message.reply_text(f"❌ Error: {e}")
+
+
+async def cmd_portfolio(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/portfolio — show full live portfolio with P&L"""
+    try:
+        await update.message.reply_text("⏳ Fetching live prices...")
+        msg = _format_portfolio_summary()
+        await update.message.reply_text(msg, parse_mode="Markdown")
+    except Exception as e:
+        logger.error(f"cmd_portfolio error: {e}")
+        await update.message.reply_text(f"❌ Error: {e}")
+
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/help — show all available commands"""
+    msg = """
+🤖 *Trading Bot Commands*
+
+*Portfolio Management:*
+/buy TICKER SHARES PRICE
+  → e.g. `/buy NVDA 10 201.50`
+  → Adds position, recalculates avg cost
+
+/sell TICKER SHARES PRICE
+  → e.g. `/sell RKLB 20 85.00`
+  → Reduces position, shows realised P&L
+
+/portfolio
+  → Shows all holdings with live P&L
+
+*Manual Triggers:*
+/scan
+  → Run Option Hunter + Swing scan now
+
+/vix
+  → Check current VIX level
+
+/help
+  → Show this message
+    """
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
+
+async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/scan — manually trigger option hunter + swing scan"""
+    try:
+        await update.message.reply_text("🔍 Running scan... this takes ~1 min")
+        vix    = get_vix()
+        opps   = run_option_hunter(vix)
+        setups = run_swing_scanner(vix)
+        await update.message.reply_text(
+            format_option_hunter(opps, vix), parse_mode="Markdown"
+        )
+        await update.message.reply_text(
+            format_swing_trades(setups, vix), parse_mode="Markdown"
+        )
+    except Exception as e:
+        logger.error(f"cmd_scan error: {e}")
+        await update.message.reply_text(f"❌ Scan error: {e}")
+
+
+async def cmd_vix(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/vix — check current VIX"""
+    try:
+        vix = get_vix()
+        if vix:
+            msg = f"{vix['emoji']} *VIX: {vix['level']:.2f}*\n{vix['sentiment']}"
+        else:
+            msg = "❌ Could not fetch VIX right now."
+        await update.message.reply_text(msg, parse_mode="Markdown")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {e}")
+
+
+# ============================================================================
 # MAIN SCHEDULER
 # ============================================================================
 
@@ -1272,9 +1540,10 @@ def main():
         logger.error("❌ TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not set — exiting")
         return
 
+    # ── Scheduler (background thread) ────────────────────────────────────────
     scheduler = BackgroundScheduler(timezone=EST)
 
-    # --- Pre-market (6:30–9:30 AM ET) ---
+    # Pre-market (6:30–9:30 AM ET)
     scheduler.add_job(job_market_report, CronTrigger(
         hour="6-9", minute=30, day_of_week="mon-fri"),
         id="pre_market_report", name="Pre-Market Report")
@@ -1283,17 +1552,15 @@ def main():
         hour=8, minute=30, day_of_week="mon-fri"),
         id="pre_market_options", name="Pre-Market Option Hunt")
 
-    # Swing trades — 9:00am ET (30 mins before open, SGT 9pm)
     scheduler.add_job(job_swing_trades, CronTrigger(
         hour=9, minute=0, day_of_week="mon-fri"),
         id="pre_market_swing", name="Pre-Market Swing Scan")
 
-    # Earnings alert — fires at 7am ET every trading day
     scheduler.add_job(job_earnings_alert, CronTrigger(
         hour=7, minute=0, day_of_week="mon-fri"),
         id="earnings_alert", name="Earnings Alert")
 
-    # --- Market hours (9:30 AM – 3:30 PM ET) ---
+    # Market hours (9:30 AM – 3:30 PM ET)
     scheduler.add_job(job_market_report, CronTrigger(
         hour="9-15", minute=30, day_of_week="mon-fri"),
         id="market_report", name="Market Hours Report")
@@ -1302,12 +1569,11 @@ def main():
         hour="10,12,14", minute=0, day_of_week="mon-fri"),
         id="market_options", name="Market Hours Option Hunt")
 
-    # Swing trades — mid-day refresh at 12pm ET
     scheduler.add_job(job_swing_trades, CronTrigger(
         hour=12, minute=0, day_of_week="mon-fri"),
         id="midday_swing", name="Midday Swing Scan")
 
-    # --- Post-market (4:00–5:00 PM ET) ---
+    # Post-market (4:00–5:00 PM ET)
     scheduler.add_job(job_trading_signals, CronTrigger(
         hour="16-17", minute="0,30", day_of_week="mon-fri"),
         id="post_signals", name="Post-Market Signals")
@@ -1317,23 +1583,28 @@ def main():
         id="post_options", name="Post-Market Option Hunt")
 
     scheduler.start()
+
     logger.info("=" * 55)
     logger.info("✅ Trading Bot v2.2 + Option Hunter + Swing Trader")
     logger.info(f"   Scanning {len(OPTION_HUNT_TICKERS)} tickers for options")
     logger.info(f"   Swing capital: ${SWING_CAPITAL:,} | Max trades: {SWING_MAX_TRADES}")
     logger.info(f"   Watching {len(EARNINGS_CALENDAR)} stocks for earnings alerts")
-    logger.info("   Swing fires: 9:00am + 12:00pm ET daily")
+    logger.info(f"   Portfolio: {len(live_portfolio)} positions (live_portfolio)")
+    logger.info("   Commands: /buy /sell /portfolio /scan /vix /help")
     logger.info("=" * 55)
 
-    try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        logger.info("🛑 Bot stopped by user")
-        scheduler.shutdown()
-    except Exception as e:
-        logger.error(f"Scheduler fatal error: {e}")
-        raise
+    # ── Telegram Application (main thread — listens for commands) ─────────────
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
+
+    app.add_handler(CommandHandler("buy",       cmd_buy))
+    app.add_handler(CommandHandler("sell",      cmd_sell))
+    app.add_handler(CommandHandler("portfolio", cmd_portfolio))
+    app.add_handler(CommandHandler("scan",      cmd_scan))
+    app.add_handler(CommandHandler("vix",       cmd_vix))
+    app.add_handler(CommandHandler("help",      cmd_help))
+
+    logger.info("🤖 Bot listening for commands...")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
