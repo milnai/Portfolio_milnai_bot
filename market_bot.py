@@ -65,6 +65,10 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# Logging must be set up first — before any function calls at module level
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
+
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
@@ -209,9 +213,6 @@ PRICE_DIFF_GATE = 0.005   # Block alert if Polygon/yfinance differ by >0.5%
 
 # --- Risk management (per strategy doc) ---
 STOP_LOSS_PCT = 0.035     # 3.5% stop loss (regular market)
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger(__name__)
 
 
 # ============================================================================
@@ -1297,25 +1298,31 @@ def job_swing_trades():
 
 
 def job_option_hunter():
-    logger.info("🎯 Sending Option Hunter + Swing Trades...")
-    try:
-        vix = get_vix()
+    logger.info("🎯 Sending Option Hunter...")
+    vix = get_vix()
 
-        # Message 1 — Option Hunter
+    # ── Message 1: Option Hunter ──────────────────────────────────────────────
+    try:
         opps = run_option_hunter(vix)
         send_telegram(format_option_hunter(opps, vix))
         logger.info(f"✅ Option Hunter sent ({len(opps)} setup(s))")
-
-        # Small pause between messages
-        time.sleep(2)
-
-        # Message 2 — Swing Trades (separate message below)
-        setups = run_swing_scanner(vix)
-        send_telegram(format_swing_trades(setups, vix))
-        logger.info(f"✅ Swing Trades sent ({len(setups)} setup(s))")
-
     except Exception as e:
-        logger.error(f"job_option_hunter: {e}")
+        logger.error(f"❌ Option Hunter failed: {e}")
+        send_telegram(f"❌ Option Hunter error: {e}")
+
+    # Pause between messages
+    time.sleep(3)
+
+    # ── Message 2: Swing Trades ───────────────────────────────────────────────
+    logger.info("📊 Sending Swing Trades...")
+    try:
+        setups = run_swing_scanner(vix)
+        msg    = format_swing_trades(setups, vix)
+        send_telegram(msg)
+        logger.info(f"✅ Swing Trades sent ({len(setups)} setup(s))")
+    except Exception as e:
+        logger.error(f"❌ Swing Trades failed: {e}")
+        send_telegram(f"❌ Swing Trades error: {e}")
 
 
 # ============================================================================
