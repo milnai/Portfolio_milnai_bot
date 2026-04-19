@@ -1297,12 +1297,23 @@ def job_swing_trades():
 
 
 def job_option_hunter():
-    logger.info("🎯 Sending Option Hunter...")
+    logger.info("🎯 Sending Option Hunter + Swing Trades...")
     try:
-        vix   = get_vix()
-        opps  = run_option_hunter(vix)
+        vix = get_vix()
+
+        # Message 1 — Option Hunter
+        opps = run_option_hunter(vix)
         send_telegram(format_option_hunter(opps, vix))
         logger.info(f"✅ Option Hunter sent ({len(opps)} setup(s))")
+
+        # Small pause between messages
+        time.sleep(2)
+
+        # Message 2 — Swing Trades (separate message below)
+        setups = run_swing_scanner(vix)
+        send_telegram(format_swing_trades(setups, vix))
+        logger.info(f"✅ Swing Trades sent ({len(setups)} setup(s))")
+
     except Exception as e:
         logger.error(f"job_option_hunter: {e}")
 
@@ -1548,14 +1559,12 @@ def main():
         hour="6-9", minute=30, day_of_week="mon-fri"),
         id="pre_market_report", name="Pre-Market Report")
 
+    # Option Hunter → then Swing Trades (2 separate messages)
     scheduler.add_job(job_option_hunter, CronTrigger(
         hour=8, minute=30, day_of_week="mon-fri"),
-        id="pre_market_options", name="Pre-Market Option Hunt")
+        id="pre_market_options", name="Pre-Market Option Hunt + Swing")
 
-    scheduler.add_job(job_swing_trades, CronTrigger(
-        hour=9, minute=0, day_of_week="mon-fri"),
-        id="pre_market_swing", name="Pre-Market Swing Scan")
-
+    # Earnings alert — 7am ET daily
     scheduler.add_job(job_earnings_alert, CronTrigger(
         hour=7, minute=0, day_of_week="mon-fri"),
         id="earnings_alert", name="Earnings Alert")
@@ -1565,22 +1574,20 @@ def main():
         hour="9-15", minute=30, day_of_week="mon-fri"),
         id="market_report", name="Market Hours Report")
 
+    # Option Hunter → then Swing Trades at 10am, 12pm, 2pm
     scheduler.add_job(job_option_hunter, CronTrigger(
         hour="10,12,14", minute=0, day_of_week="mon-fri"),
-        id="market_options", name="Market Hours Option Hunt")
-
-    scheduler.add_job(job_swing_trades, CronTrigger(
-        hour=12, minute=0, day_of_week="mon-fri"),
-        id="midday_swing", name="Midday Swing Scan")
+        id="market_options", name="Market Hours Option Hunt + Swing")
 
     # Post-market (4:00–5:00 PM ET)
     scheduler.add_job(job_trading_signals, CronTrigger(
         hour="16-17", minute="0,30", day_of_week="mon-fri"),
         id="post_signals", name="Post-Market Signals")
 
+    # Option Hunter → then Swing Trades at 4:15pm
     scheduler.add_job(job_option_hunter, CronTrigger(
         hour=16, minute=15, day_of_week="mon-fri"),
-        id="post_options", name="Post-Market Option Hunt")
+        id="post_options", name="Post-Market Option Hunt + Swing")
 
     scheduler.start()
 
