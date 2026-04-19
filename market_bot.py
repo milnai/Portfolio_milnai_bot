@@ -75,43 +75,17 @@ SGT = pytz.timezone("Asia/Singapore")
 
 # --- Holdings (updated Apr 18 2026: RKLB 67 shares, APLD added) ---
 HOLDINGS = {
-    # ── STOCKS ──────────────────────────────
-    "RKLB": {"shares": 67,  "avg_cost": 68.439, "type": "stock"},
-    "NVDA": {"shares": 10,  "avg_cost": 175.90, "type": "stock"},
-    "NBIS": {"shares": 5,   "avg_cost": 114.90, "type": "stock"},
-    "ALAB": {"shares": 3,   "avg_cost": 116.00, "type": "stock"},
-    "NVDL": {"shares": 10,  "avg_cost": 80.90,  "type": "stock"},
-    "MSFT": {"shares": 2,   "avg_cost": 372.50, "type": "stock"},
-    "SCHD": {"shares": 15,  "avg_cost": 30.50,  "type": "stock"},
-    "APLD": {"shares": 10,  "avg_cost": 31.40,  "type": "stock"},
-    "SLV":  {"shares": 18,  "avg_cost": 90.667, "type": "stock"},
-    "GRAB": {"shares": 284, "avg_cost": 5.899,  "type": "stock"},
-
-    # ── OPTIONS ─────────────────────────────
-    "NVDA_CALL_260618_200": {
-        "contracts": 1,
-        "avg_cost": 12.00,
-        "strike": 200,
-        "expiry": "2026-06-18",
-        "type": "call_option",
-        "ticker": "NVDA"
-    },
-    "NVDA_CALL_260508_205": {
-        "contracts": 2,
-        "avg_cost": 4.85,
-        "strike": 205,
-        "expiry": "2026-05-08",
-        "type": "call_option",
-        "ticker": "NVDA"
-    },
-    "TSM_CALL_260618_380": {
-        "contracts": 1,
-        "avg_cost": 19.00,
-        "strike": 380,
-        "expiry": "2026-06-18",
-        "type": "call_option",
-        "ticker": "TSM"
-    },
+    "RKLB": {"shares": 67,  "avg_cost": 68.439},
+    "NVDA": {"shares": 10,  "avg_cost": 175.90},
+    "MSFT": {"shares": 2,   "avg_cost": 372.50},
+    "ALAB": {"shares": 3,   "avg_cost": 116.00},
+    "SCHD": {"shares": 15,  "avg_cost": 30.50},
+    "NBIS": {"shares": 5,   "avg_cost": 114.90},
+    "NVDL": {"shares": 10,  "avg_cost": 80.90},
+    "SLV":  {"shares": 18,  "avg_cost": 90.667},
+    "GRAB": {"shares": 284, "avg_cost": 5.899},
+    "IREN": {"shares": 5,   "avg_cost": 47.00},
+    "APLD": {"shares": 10,  "avg_cost": 31.40},
 }
 
 MARKET_TICKERS = ["SPY", "QQQ"]
@@ -163,6 +137,22 @@ EARNINGS_CALENDAR = {
     "AAPL": "2026-05-01",
     "MSFT": "2026-04-30",
     "GOOGL":"2026-04-29",
+}
+
+# --- Swing Trade Configuration ---
+SWING_CAPITAL       = 2000    # Total capital allocated for swing trades (SGD/USD)
+SWING_MAX_TRADES    = 2       # Max simultaneous swing positions
+SWING_HOLD_DAYS     = 2       # Max hold days before forced exit
+SWING_MIN_PRICE     = 5.0     # Ignore penny stocks below this price
+SWING_MIN_RR        = 2.0     # Minimum risk/reward ratio to qualify
+SWING_TARGET1_PCT   = 0.05    # First target: +5% (sell 50%)
+SWING_TARGET2_PCT   = 0.10    # Second target: +10% (sell remaining 50%)
+
+# VIX-calibrated risk per trade
+SWING_RISK = {
+    "low":      0.03,   # VIX < 20  → risk 3% of capital = $60
+    "medium":   0.02,   # VIX 20-25 → risk 2% = $40
+    "high":     0.01,   # VIX > 25  → risk 1% = $20
 }
 
 # --- Signal thresholds (per strategy doc) ---
@@ -946,6 +936,254 @@ def format_option_hunter(opportunities, vix):
 
 
 # ============================================================================
+# SWING TRADE ENGINE
+# ============================================================================
+
+def _atr(highs, lows, closes, period=14):
+    """Average True Range — measures stock's natural volatility for stop sizing."""
+    try:
+        h = np.array(highs[-period-1:], dtype=float)
+        l = np.array(lows[-period-1:],  dtype=float)
+        c = np.array(closes[-period-1:], dtype=float)
+        trs = []
+        for i in range(1, len(c)):
+            trs.append(max(h[i]-l[i], abs(h[i]-c[i-1]), abs(l[i]-c[i-1])))
+        return np.mean(trs) if trs else None
+    except:
+        return None
+
+
+def _is_near_earnings(ticker):
+    """Returns True if stock has earnings within 2 days — skip swing trades."""
+    today = datetime.now(EST).date()
+    date_str = EARNINGS_CALENDAR.get(ticker)
+    if not date_str:
+        return False
+    earn_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+    return 0 <= (earn_date - today).days <= 2
+
+
+def _get_top_movers():
+    """Fetch today's top % gainers from yfinance screener proxy."""
+    movers = []
+    try:
+        # Use a broad ETF holdings proxy — scan high-volume liquid names
+        candidates = [
+            "NVDA","AMD","TSLA","AAPL","META","AMZN","MSFT","GOOGL",
+            "ARM","MRVL","AVGO","PLTR","CRWD","PANW","SHOP","SOFI",
+            "HIMS","CRWV","NBIS","RKLB","ALAB","IREN","APLD","COIN",
+        ]
+        for ticker in candidates:
+            try:
+                info  = yf.Ticker(ticker).fast_info
+                price = getattr(info, "last_price", None)
+                prev  = getattr(info, "previous_close", None)
+                if price and prev and float(prev) > 0:
+                    pct = (float(price) - float(prev)) / float(prev) * 100
+                    if abs(pct) >= 3.0:  # Moving 3%+ today
+                        movers.append(ticker)
+            except:
+                continue
+    except Exception as e:
+        logger.warning(f"Top movers scan: {e}")
+    return movers
+
+
+def run_swing_scanner(vix):
+    """
+    Scans all 3 universes for swing trade setups.
+    Returns top 3 setups sorted by score and R/R ratio.
+    """
+    logger.info("📊 Swing Trade Scanner running...")
+
+    # Determine VIX risk tier
+    vix_level = vix["level"] if vix else 20
+    if vix_level < 20:
+        risk_tier, risk_pct = "low", SWING_RISK["low"]
+    elif vix_level < 25:
+        risk_tier, risk_pct = "medium", SWING_RISK["medium"]
+    else:
+        risk_tier, risk_pct = "high", SWING_RISK["high"]
+
+    risk_dollars = SWING_CAPITAL * risk_pct  # e.g. $60 at risk per trade
+
+    # Build combined universe
+    universe = list(set(
+        list(HOLDINGS.keys()) +
+        OPTION_HUNT_TICKERS +
+        _get_top_movers()
+    ))
+
+    results = []
+
+    for ticker in universe:
+        try:
+            # Skip penny stocks and earnings risk
+            data = get_stock_data(ticker)
+            if not data:
+                continue
+            if data["current_price"] < SWING_MIN_PRICE:
+                continue
+            if _is_near_earnings(ticker):
+                logger.info(f"   {ticker} skipped — earnings within 2 days")
+                continue
+
+            # Score with 6-indicator system
+            scored = score_ticker(data)
+            if not scored:
+                continue
+
+            score = scored["score"]
+
+            # Only take strong/medium BUY swings (long only on cash account)
+            if score < BUY_MEDIUM:
+                continue
+
+            # RSI check — avoid overbought entries (RSI 40-68 sweet spot)
+            rsi = scored.get("rsi")
+            if rsi and (rsi > 68 or rsi < 35):
+                continue
+
+            # Volume check — must have conviction
+            vols = data["volumes"]
+            if len(vols) >= 20:
+                avg_vol    = np.mean(vols[-20:])
+                vol_ratio  = vols[-1] / avg_vol if avg_vol > 0 else 1
+                if vol_ratio < 1.3:
+                    continue  # Low volume = weak conviction
+
+            # ATR-based stop loss (1.5× ATR below entry)
+            atr = _atr(data["highs"], data["lows"], data["closes"])
+            if not atr:
+                continue
+
+            entry      = data["current_price"]
+            stop       = round(entry - (1.5 * atr), 2)
+            risk_per_share = entry - stop
+
+            if risk_per_share <= 0:
+                continue
+
+            # Position sizing — shares based on dollar risk
+            shares = max(1, int(risk_dollars / risk_per_share))
+
+            # Cap shares so total position ≤ 75% of swing capital
+            max_shares = int((SWING_CAPITAL * 0.75) / entry)
+            shares     = min(shares, max_shares)
+
+            position_value = round(shares * entry, 2)
+            dollar_risk    = round(shares * risk_per_share, 2)
+
+            # Profit targets
+            t1_price  = round(entry * (1 + SWING_TARGET1_PCT), 2)
+            t2_price  = round(entry * (1 + SWING_TARGET2_PCT), 2)
+            t1_profit = round(shares * 0.5 * (t1_price - entry), 2)
+            t2_profit = round(shares * 0.5 * (t2_price - entry), 2)
+            total_profit = round(t1_profit + t2_profit, 2)
+
+            # Risk/Reward check
+            rr = round(total_profit / dollar_risk, 2) if dollar_risk > 0 else 0
+            if rr < SWING_MIN_RR:
+                continue
+
+            # Cancel trigger — if opens below this, skip the trade
+            cancel_below = round(entry * 0.99, 2)
+
+            results.append({
+                "ticker":         ticker,
+                "score":          score,
+                "entry":          entry,
+                "stop":           stop,
+                "t1_price":       t1_price,
+                "t2_price":       t2_price,
+                "t1_profit":      t1_profit,
+                "t2_profit":      t2_profit,
+                "total_profit":   total_profit,
+                "shares":         shares,
+                "position_value": position_value,
+                "dollar_risk":    dollar_risk,
+                "rr":             rr,
+                "rsi":            round(rsi, 1) if rsi else "N/A",
+                "vol_ratio":      round(vol_ratio, 1),
+                "atr":            round(atr, 2),
+                "cancel_below":   cancel_below,
+                "risk_tier":      risk_tier,
+                "details":        scored["details"],
+            })
+
+            time.sleep(0.3)
+
+        except Exception as e:
+            logger.warning(f"Swing scan {ticker}: {e}")
+            continue
+
+    # Sort by score then R/R, return top 3
+    results.sort(key=lambda x: (x["score"], x["rr"]), reverse=True)
+    logger.info(f"📊 Swing scanner found {len(results)} setup(s)")
+    return results[:3]
+
+
+def format_swing_trades(setups, vix):
+    """Format swing trade Telegram message."""
+    try:
+        t   = _time_display()
+        msg = "📊 *SWING TRADE SETUPS*\n"
+        msg += f"_{t['sgt']} | {t['est']}_\n\n"
+
+        vix_level = vix["level"] if vix else 20
+        if vix:
+            msg += f"{vix['emoji']} *VIX: {vix_level:.1f}* — {vix['sentiment']}\n"
+
+        # Capital summary
+        risk_pct   = SWING_RISK["low"] if vix_level < 20 else (
+                     SWING_RISK["medium"] if vix_level < 25 else SWING_RISK["high"])
+        risk_dollars = SWING_CAPITAL * risk_pct
+        msg += f"💰 Capital: ${SWING_CAPITAL:,} | Risk/trade: ${risk_dollars:.0f} "
+        msg += f"({risk_pct*100:.0f}% — VIX calibrated)\n"
+        msg += f"🎯 Daily target: ${SWING_CAPITAL*0.03:.0f}–${SWING_CAPITAL*0.075:.0f} "
+        msg += f"| Max trades: {SWING_MAX_TRADES}\n\n"
+
+        if not setups:
+            msg += "🔍 *No qualifying swing setups this scan.*\n"
+            msg += "_Criteria: Score ≥4/6 | RSI 35-68 | Volume >1.3× | R/R ≥1:2_\n"
+            return msg
+
+        signal_labels = {5: "🟢🟢 STRONG SWING", 4: "🟢 MEDIUM SWING"}
+
+        for i, s in enumerate(setups, 1):
+            label = signal_labels.get(s["score"], "🟢 SWING")
+            msg += f"{'━'*35}\n"
+            msg += f"{label}: *{s['ticker']}*\n"
+            msg += f"Score: {s['score']:+d}/6 | RSI: {s['rsi']} | Vol: {s['vol_ratio']}× avg\n\n"
+
+            msg += f"*Entry:*  ${s['entry']:.2f} _(limit order)_\n"
+            msg += f"*Shares:* {s['shares']} shares = ${s['position_value']:,.0f}\n"
+            msg += f"*Stop:*   ${s['stop']:.2f} (1.5× ATR = -${s['dollar_risk']:.0f} max loss)\n\n"
+
+            msg += f"*🎯 Target 1:* ${s['t1_price']:.2f} (+5%) → sell 50% = +${s['t1_profit']:.0f}\n"
+            msg += f"*🎯 Target 2:* ${s['t2_price']:.2f} (+10%) → sell 50% = +${s['t2_profit']:.0f}\n"
+            msg += f"*Total if both hit:* +${s['total_profit']:.0f}\n"
+            msg += f"*R/R Ratio:* 1:{s['rr']} ✅\n\n"
+
+            msg += f"⏱ Hold max *{SWING_HOLD_DAYS} days* — exit regardless\n"
+            msg += f"❌ *Cancel if opens below ${s['cancel_below']:.2f}*\n\n"
+
+            msg += f"Why now:\n"
+            for d in s["details"][:4]:
+                msg += f"  {d}\n"
+            msg += "\n"
+
+        msg += "━" * 35 + "\n"
+        msg += f"⚠️ _Max {SWING_MAX_TRADES} trades open at once. "
+        msg += f"Never risk >3% capital per trade. Exit at T1 if no movement by EOD2._"
+        return msg
+
+    except Exception as e:
+        logger.error(f"format_swing_trades: {e}")
+        return "❌ Swing trade error"
+
+
+# ============================================================================
 # TELEGRAM SENDER (with chunking for long messages)
 # ============================================================================
 
@@ -1003,6 +1241,17 @@ def job_earnings_alert():
         logger.error(f"job_earnings_alert: {e}")
 
 
+def job_swing_trades():
+    logger.info("📊 Running Swing Trade Scanner...")
+    try:
+        vix    = get_vix()
+        setups = run_swing_scanner(vix)
+        send_telegram(format_swing_trades(setups, vix))
+        logger.info(f"✅ Swing trades sent ({len(setups)} setup(s))")
+    except Exception as e:
+        logger.error(f"job_swing_trades: {e}")
+
+
 def job_option_hunter():
     logger.info("🎯 Sending Option Hunter...")
     try:
@@ -1034,6 +1283,11 @@ def main():
         hour=8, minute=30, day_of_week="mon-fri"),
         id="pre_market_options", name="Pre-Market Option Hunt")
 
+    # Swing trades — 9:00am ET (30 mins before open, SGT 9pm)
+    scheduler.add_job(job_swing_trades, CronTrigger(
+        hour=9, minute=0, day_of_week="mon-fri"),
+        id="pre_market_swing", name="Pre-Market Swing Scan")
+
     # Earnings alert — fires at 7am ET every trading day
     scheduler.add_job(job_earnings_alert, CronTrigger(
         hour=7, minute=0, day_of_week="mon-fri"),
@@ -1048,6 +1302,11 @@ def main():
         hour="10,12,14", minute=0, day_of_week="mon-fri"),
         id="market_options", name="Market Hours Option Hunt")
 
+    # Swing trades — mid-day refresh at 12pm ET
+    scheduler.add_job(job_swing_trades, CronTrigger(
+        hour=12, minute=0, day_of_week="mon-fri"),
+        id="midday_swing", name="Midday Swing Scan")
+
     # --- Post-market (4:00–5:00 PM ET) ---
     scheduler.add_job(job_trading_signals, CronTrigger(
         hour="16-17", minute="0,30", day_of_week="mon-fri"),
@@ -1059,11 +1318,11 @@ def main():
 
     scheduler.start()
     logger.info("=" * 55)
-    logger.info("✅ Trading Bot v2.1 + Option Hunter LIVE")
-    logger.info(f"  Scanning {len(OPTION_HUNT_TICKERS)} tickers for options")
-    logger.info(f"  Watching {len(EARNINGS_CALENDAR)} stocks for earnings alerts")
-    logger.info("   Data: yfinance (quotes + candles + options)")
-    logger.info("   Earnings: 7am ET daily pre-earnings PUT/CALL alert")
+    logger.info("✅ Trading Bot v2.2 + Option Hunter + Swing Trader")
+    logger.info(f"   Scanning {len(OPTION_HUNT_TICKERS)} tickers for options")
+    logger.info(f"   Swing capital: ${SWING_CAPITAL:,} | Max trades: {SWING_MAX_TRADES}")
+    logger.info(f"   Watching {len(EARNINGS_CALENDAR)} stocks for earnings alerts")
+    logger.info("   Swing fires: 9:00am + 12:00pm ET daily")
     logger.info("=" * 55)
 
     try:
