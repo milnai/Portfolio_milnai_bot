@@ -74,7 +74,7 @@ EST = pytz.timezone("US/Eastern")
 SGT = pytz.timezone("Asia/Singapore")
 
 # --- Holdings (updated Apr 18 2026: RKLB 67 shares, APLD added) ---
-PORTFOLIO = {
+HOLDINGS = {
     # ── STOCKS ──────────────────────────────
     "RKLB": {"shares": 67,  "avg_cost": 68.439, "type": "stock"},
     "NVDA": {"shares": 10,  "avg_cost": 175.90, "type": "stock"},
