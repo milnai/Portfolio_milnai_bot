@@ -132,8 +132,28 @@ def save_portfolio(portfolio):
 live_portfolio = load_portfolio()
 
 # ============================================================================
-# REMINDER SYSTEM
+# USER SETTINGS
 # ============================================================================
+
+SETTINGS_FILE = "settings.json"
+
+def load_settings():
+    try:
+        if os.path.exists(SETTINGS_FILE):
+            with open(SETTINGS_FILE, "r") as f:
+                return json.load(f)
+    except:
+        pass
+    return {"swing_capital": 2000, "name": ""}
+
+def save_settings(s):
+    try:
+        with open(SETTINGS_FILE, "w") as f:
+            json.dump(s, f, indent=2)
+    except Exception as e:
+        logger.error(f"Could not save settings: {e}")
+
+user_settings = load_settings()
 
 REMINDERS_FILE = "reminders.json"
 
@@ -1559,6 +1579,93 @@ def _format_portfolio_summary():
     msg += f"{emoji} *TOTAL P&L: ${total_pnl:+.0f} ({total_pnl_pct:+.1f}%)*\n"
     msg += f"Value: ${total_value:,.0f} | Cost: ${total_cost:,.0f}"
     return msg
+
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/start — welcome message and quick command guide"""
+    name = user_settings.get("name", "")
+    if name:
+        msg  = f"👋 Welcome back, *{name}*!\n\n"
+        msg += "Your bot is live and running. Use:\n\n"
+        msg += "/portfolio — view live P&L\n"
+        msg += "/scan — run Option Hunter + Swing scan\n"
+        msg += "/remind TICKER — analyze a stock\n"
+        msg += "/help — all commands"
+    else:
+        msg  = "🤖 *Welcome to Milnai Trading Bot!*\n\n"
+        msg += "I help you track your portfolio, find option setups and swing trades — all via Telegram.\n\n"
+        msg += "*Quick start:*\n"
+        msg += "/portfolio — see your holdings\n"
+        msg += "/scan — run full market scan now\n"
+        msg += "/buy NVDA 10 201.50 — add a position\n"
+        msg += "/remind NVDA — analyze a stock\n"
+        msg += "/help — see all commands\n\n"
+        msg += "📅 Automatic alerts fire Mon–Fri during US market hours."
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
+
+async def cmd_setup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/setup — show setup instructions"""
+    msg  = "⚙️ *Bot Setup*\n\n"
+    msg += "*Step 1 — Add your holdings:*\n"
+    msg += "`/buy TICKER SHARES AVGPRICE`\n"
+    msg += "e.g. `/buy NVDA 10 175.90`\n\n"
+    msg += "*Step 2 — Set swing capital:*\n"
+    msg += "`/capital 2000`\n\n"
+    msg += "*Step 3 — Check it works:*\n"
+    msg += "`/portfolio` — see your P&L\n"
+    msg += "`/vix` — check market mood\n"
+    msg += "`/scan` — run a manual scan\n\n"
+    msg += "That's it! Automatic alerts will fire during US market hours."
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
+
+async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/done — confirm setup complete"""
+    count = len(live_portfolio)
+    cap   = user_settings.get("swing_capital", 2000)
+    msg   = f"✅ *Setup confirmed!*\n\n"
+    msg  += f"📋 Holdings: {count} position(s)\n"
+    msg  += f"💰 Swing capital: ${cap:,}\n\n"
+    msg  += "Your bot is now live. Use /help to see all commands."
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
+
+async def cmd_capital(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/capital AMOUNT — update swing trade capital"""
+    global user_settings
+    try:
+        if not context.args:
+            cap = user_settings.get("swing_capital", 2000)
+            await update.message.reply_text(
+                f"💰 Current swing capital: *${cap:,}*\n"
+                f"To change: `/capital 3000`",
+                parse_mode="Markdown"
+            )
+            return
+        capital = float(context.args[0])
+        if capital <= 0:
+            await update.message.reply_text("❌ Capital must be a positive number.")
+            return
+        user_settings["swing_capital"] = capital
+        save_settings(user_settings)
+        await update.message.reply_text(
+            f"✅ Swing capital updated to *${capital:,.0f}*\n"
+            f"Risk per trade: ~${capital*0.03:.0f} (3% VIX-calibrated)",
+            parse_mode="Markdown"
+        )
+    except ValueError:
+        await update.message.reply_text("❌ Usage: `/capital 2000`", parse_mode="Markdown")
+
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle free text — guide user to commands"""
+    text = update.message.text.strip()
+    if text and not text.startswith("/"):
+        await update.message.reply_text(
+            "💬 Use commands to talk to me. Type /help to see what I can do.",
+            parse_mode="Markdown"
+        )
 
 
 async def cmd_remind(update: Update, context: ContextTypes.DEFAULT_TYPE):
