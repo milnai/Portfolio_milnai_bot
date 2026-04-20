@@ -131,7 +131,173 @@ def save_portfolio(portfolio):
 # Live portfolio — loaded on startup, updated via Telegram commands
 live_portfolio = load_portfolio()
 
-# --- Option Hunter scan universe (expanded from watchlist — 75 tickers) ---
+# ============================================================================
+# REMINDER SYSTEM
+# ============================================================================
+
+REMINDERS_FILE = "reminders.json"
+
+def load_reminders():
+    try:
+        if os.path.exists(REMINDERS_FILE):
+            with open(REMINDERS_FILE, "r") as f:
+                return json.load(f)
+    except:
+        pass
+    return []
+
+def save_reminders(reminders_list):
+    try:
+        with open(REMINDERS_FILE, "w") as f:
+            json.dump(reminders_list, f, indent=2)
+    except Exception as e:
+        logger.error(f"Could not save reminders: {e}")
+
+# Live reminders — loaded on startup
+reminders = load_reminders()
+
+
+def analyze_for_reminder(ticker):
+    """
+    Full analysis of a ticker for the /remind command.
+    Returns verdict, score, key reasons, suggested action price.
+    """
+    try:
+        data = get_stock_data(ticker)
+        if not data:
+            return None
+        scored = score_ticker(data)
+        if not scored:
+            return None
+
+        score   = scored["score"]
+        price   = data["current_price"]
+        bb      = scored.get("bb")
+        rsi     = scored.get("rsi")
+
+        if score >= 5:
+            verdict    = "🟢🟢 STRONG BUY"
+            action     = "BUY"
+            suggestion = f"Entry near ${bb['lower']:.2f} (BB lower)" if bb else f"Entry ~${price*0.98:.2f}"
+        elif score >= 4:
+            verdict    = "🟢 MEDIUM BUY"
+            action     = "BUY"
+            suggestion = f"Entry at current ${price:.2f}"
+        elif score <= -4:
+            verdict    = "🔴🔴 STRONG SELL"
+            action     = "SELL"
+            suggestion = f"Exit near ${bb['upper']:.2f} (BB upper)" if bb else f"Exit ~${price*1.02:.2f}"
+        elif score <= -2:
+            verdict    = "🔴 TRIM POSITION"
+            action     = "SELL"
+            suggestion = "Trim 30-50% to lock gains"
+        else:
+            verdict    = "⏸️ HOLD / NEUTRAL"
+            action     = "WAIT"
+            suggestion = "No clear signal — wait for stronger setup"
+
+        earn_warning = ""
+        earn_date = EARNINGS_CALENDAR.get(ticker)
+        if earn_date:
+            today     = datetime.now(EST).date()
+            earn_dt   = datetime.strptime(earn_date, "%Y-%m-%d").date()
+            days_away = (earn_dt - today).days
+            if 0 <= days_away <= 14:
+                earn_warning = f"⚠️ Earnings in {days_away} days ({earn_date})"
+
+        return {
+            "ticker":       ticker,
+            "price":        price,
+            "score":        score,
+            "verdict":      verdict,
+            "action":       action,
+            "suggestion":   suggestion,
+            "details":      scored["details"],
+            "rsi":          round(rsi, 1) if rsi else None,
+            "earn_warning": earn_warning,
+        }
+    except Exception as e:
+        logger.error(f"analyze_for_reminder {ticker}: {e}")
+        return None
+
+
+def format_reminders_section():
+    """
+    Formats the reminders section shown ABOVE Option Hunter.
+    Checks date-based and price-based reminders.
+    """
+    if not reminders:
+        return None
+
+    today = datetime.now(EST).date()
+    t     = _time_display()
+    lines = []
+    to_remove = []
+
+    for r in reminders:
+        ticker = r["ticker"]
+        action = r["action"]
+        note   = r.get("note", "")
+        emoji  = "🟢" if action == "BUY" else ("🔴" if action == "SELL" else "⏸️")
+
+        # Date-based reminder
+        if r.get("remind_date"):
+            try:
+                remind_dt = datetime.strptime(r["remind_date"], "%Y-%m-%d").date()
+                days_left = (remind_dt - today).days
+                if days_left < 0:
+                    to_remove.append(r)
+                    continue
+                elif days_left == 0:
+                    lines.append(f"🔔 *TODAY* — {emoji} {action} *{ticker}*\n   {note}")
+                    to_remove.append(r)
+                elif days_left <= 3:
+                    lines.append(f"⏰ *In {days_left} day(s)* — {emoji} {action} *{ticker}*\n   {note}")
+                else:
+                    lines.append(f"📅 *{r['remind_date']}* — {emoji} {action} *{ticker}*\n   {note}")
+            except:
+                continue
+
+        # Price-based reminder
+        elif r.get("target_price"):
+            try:
+                target  = float(r["target_price"])
+                data    = get_stock_data(ticker)
+                current = data["current_price"] if data else None
+                if current:
+                    diff_pct = ((current - target) / target * 100)
+                    if action == "BUY" and current <= target * 1.005:
+                        lines.append(f"🔔 *PRICE HIT!* 🟢 BUY *{ticker}* @ ${current:.2f} (target ${target:.2f})\n   {note}")
+                        to_remove.append(r)
+                    elif action == "SELL" and current >= target * 0.995:
+                        lines.append(f"🔔 *PRICE HIT!* 🔴 SELL *{ticker}* @ ${current:.2f} (target ${target:.2f})\n   {note}")
+                        to_remove.append(r)
+                    else:
+                        arrow = "📈" if action == "BUY" else "📉"
+                        lines.append(
+                            f"{arrow} {emoji} {action} *{ticker}* when ${target:.2f} | "
+                            f"Now ${current:.2f} ({diff_pct:+.1f}% away)\n   {note}"
+                        )
+                else:
+                    lines.append(f"{emoji} {action} *{ticker}* @ ${target:.2f} | {note}")
+            except:
+                continue
+
+    # Clean up fired reminders
+    for r in to_remove:
+        if r in reminders:
+            reminders.remove(r)
+    if to_remove:
+        save_reminders(reminders)
+
+    if not lines:
+        return None
+
+    msg  = "🔔 *REMINDERS*\n"
+    msg += f"_{t['sgt']} | {t['est']}_\n\n"
+    msg += "\n".join(lines)
+    msg += "\n\n_/reminders to manage | /remind TICKER to add new_"
+    return msg
 OPTION_HUNT_TICKERS = [
     # Broad ETFs
     "SPY", "QQQ", "IWM", "GLD", "SLV",
@@ -858,60 +1024,78 @@ def format_market_report(portfolio, market, vix):
 def format_trading_signals(vix):
     try:
         t   = _time_display()
-        msg = "📈 *TRADING SIGNALS*\n"
+        msg = "📈 *TRADING SIGNALS — YOUR PORTFOLIO*\n"
         msg += f"_{t['sgt']} | {t['est']}_\n\n"
 
         if vix:
             msg += f"{vix['emoji']} *VIX: {vix['level']:.2f}* — {vix['sentiment']}\n\n"
 
-        buys, sells = [], []
+        buys, sells, holds = [], [], []
 
-        for ticker in HOLDINGS:
+        for ticker in live_portfolio:
             data = get_stock_data(ticker)
             if not data:
                 continue
             scored = score_ticker(data)
             if not scored:
                 continue
-            signal = classify_signal(scored["score"])
-            if signal in ("STRONG_BUY", "MEDIUM_BUY"):
-                buys.append((ticker, data, scored, signal))
-            elif signal in ("STRONG_SELL", "WEAK_SELL"):
-                sells.append((ticker, data, scored, signal))
+            score  = scored["score"]
+            signal = classify_signal(score)
+            info   = live_portfolio[ticker]
+            price  = data["current_price"]
+            pnl_pct = ((price - info["avg_cost"]) / info["avg_cost"] * 100)
 
-        # --- BUY block ---
+            if signal in ("STRONG_BUY", "MEDIUM_BUY"):
+                buys.append((ticker, data, scored, signal, pnl_pct))
+            elif signal in ("STRONG_SELL", "WEAK_SELL"):
+                sells.append((ticker, data, scored, signal, pnl_pct))
+            else:
+                holds.append((ticker, price, score, pnl_pct))
+
+        # --- BUY / ADD block ---
         if buys:
-            for ticker, data, scored, signal in buys:
+            msg += "🟢 *ADD TO POSITION*\n"
+            msg += "_(These holdings show fresh buy signals — consider adding more)_\n\n"
+            for ticker, data, scored, signal, pnl_pct in buys:
                 price = data["current_price"]
                 entry = scored["bb"]["lower"] if scored.get("bb") else price * 0.98
                 stop  = entry * (1 - STOP_LOSS_PCT)
-                label = "🔥 *HIGHLY RECOMMENDED BUY*" if (vix and vix["is_fearful"]) else (
-                        "🟢🟢 *STRONG BUY*" if signal == "STRONG_BUY" else "🟢 *MEDIUM BUY*")
-                msg += f"{label}\n"
-                msg += f"*{ticker}* @ ${price:.2f} | Score: {scored['score']:+d}/6\n"
-                msg += f"Entry: ${entry:.2f} | Stop: ${stop:.2f} (-{STOP_LOSS_PCT*100:.1f}%)\n"
-                for d in scored["details"]:
+                label = "🟢🟢 STRONG ADD" if signal == "STRONG_BUY" else "🟢 MEDIUM ADD"
+                msg += f"{label}: *{ticker}* @ ${price:.2f} | Score: {scored['score']:+d}/6\n"
+                msg += f"Your P&L: {pnl_pct:+.1f}% | Entry: ${entry:.2f} | Stop: ${stop:.2f}\n"
+                for d in scored["details"][:3]:
                     msg += f"  {d}\n"
                 msg += "\n"
         else:
-            msg += "🟢 *BUY SIGNALS:* None right now\n\n"
+            msg += "🟢 *ADD SIGNALS:* None right now\n\n"
 
         msg += "=" * 35 + "\n\n"
 
-        # --- SELL block ---
+        # --- SELL / TRIM block ---
         if sells:
-            for ticker, data, scored, signal in sells:
+            msg += "🔴 *CONSIDER TRIMMING*\n"
+            msg += "_(Overbought signals — not panic sell, just take partial profits)_\n\n"
+            for ticker, data, scored, signal, pnl_pct in sells:
                 price = data["current_price"]
                 exit_ = scored["bb"]["upper"] if scored.get("bb") else price * 1.02
-                label = "🔴🔴 *STRONG SELL*" if signal == "STRONG_SELL" else "🔴 *WEAK SELL*"
-                msg += f"{label}\n"
-                msg += f"*{ticker}* @ ${price:.2f} | Score: {scored['score']:+d}/6\n"
-                msg += f"Exit target: ${exit_:.2f}\n"
-                for d in scored["details"]:
+                label = "🔴🔴 STRONGLY TRIM" if signal == "STRONG_SELL" else "🔴 TRIM SOME"
+                msg += f"{label}: *{ticker}* @ ${price:.2f} | Score: {scored['score']:+d}/6\n"
+                msg += f"Your P&L: {pnl_pct:+.1f}% | Trim target: ${exit_:.2f}\n"
+                msg += f"💡 Suggestion: Sell 30-50% to lock in gains, hold the rest\n"
+                for d in scored["details"][:3]:
                     msg += f"  {d}\n"
                 msg += "\n"
         else:
-            msg += "🔴 *SELL SIGNALS:* None right now\n"
+            msg += "🔴 *TRIM SIGNALS:* None right now\n\n"
+
+        msg += "=" * 35 + "\n\n"
+
+        # --- HOLD block (brief summary) ---
+        if holds:
+            msg += "⏸️ *HOLD — No action needed:*\n"
+            for ticker, price, score, pnl_pct in holds:
+                emoji = "🟢" if pnl_pct >= 0 else "🔴"
+                msg += f"{emoji} {ticker}: ${price:.2f} | Score: {score:+d}/6 | P&L: {pnl_pct:+.1f}%\n"
 
         return msg
     except Exception as e:
@@ -1298,8 +1482,18 @@ def job_swing_trades():
 
 
 def job_option_hunter():
-    logger.info("🎯 Sending Option Hunter...")
+    logger.info("🎯 Sending Reminders + Option Hunter + Swing Trades...")
     vix = get_vix()
+
+    # ── Message 0: Reminders (above Option Hunter) ────────────────────────────
+    try:
+        reminder_msg = format_reminders_section()
+        if reminder_msg:
+            send_telegram(reminder_msg)
+            logger.info("✅ Reminders sent")
+            time.sleep(2)
+    except Exception as e:
+        logger.error(f"❌ Reminders failed: {e}")
 
     # ── Message 1: Option Hunter ──────────────────────────────────────────────
     try:
@@ -1310,7 +1504,6 @@ def job_option_hunter():
         logger.error(f"❌ Option Hunter failed: {e}")
         send_telegram(f"❌ Option Hunter error: {e}")
 
-    # Pause between messages
     time.sleep(3)
 
     # ── Message 2: Swing Trades ───────────────────────────────────────────────
@@ -1366,6 +1559,157 @@ def _format_portfolio_summary():
     msg += f"{emoji} *TOTAL P&L: ${total_pnl:+.0f} ({total_pnl_pct:+.1f}%)*\n"
     msg += f"Value: ${total_value:,.0f} | Cost: ${total_cost:,.0f}"
     return msg
+
+
+async def cmd_remind(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /remind TICKER — analyze stock and offer to set a reminder
+    /remind TICKER BUY 200.00 2026-05-15 — add price+date reminder directly
+    /remind TICKER SELL 250.00 — add price-only reminder
+    """
+    try:
+        if not context.args:
+            await update.message.reply_text(
+                "📅 *How to use /remind:*\n\n"
+                "Analyze a stock:\n"
+                "`/remind NVDA`\n\n"
+                "Set a buy reminder at price:\n"
+                "`/remind NVDA BUY 190.00`\n\n"
+                "Set a sell reminder at price:\n"
+                "`/remind NVDA SELL 220.00`\n\n"
+                "Set a date reminder:\n"
+                "`/remind NVDA BUY 190.00 2026-05-15`\n\n"
+                "See all reminders:\n"
+                "`/reminders`",
+                parse_mode="Markdown"
+            )
+            return
+
+        ticker = context.args[0].upper()
+
+        # Quick add mode: /remind TICKER BUY/SELL PRICE [DATE]
+        if len(context.args) >= 3:
+            action       = context.args[1].upper()
+            target_price = float(context.args[2])
+            remind_date  = context.args[3] if len(context.args) >= 4 else None
+
+            if action not in ("BUY", "SELL", "WATCH"):
+                await update.message.reply_text("❌ Action must be BUY, SELL or WATCH")
+                return
+
+            # Get current price for context
+            data    = get_stock_data(ticker)
+            current = data["current_price"] if data else None
+
+            reminder = {
+                "ticker":       ticker,
+                "action":       action,
+                "target_price": target_price,
+                "remind_date":  remind_date,
+                "note":         f"Set via /remind on {datetime.now(EST).strftime('%Y-%m-%d')}",
+                "added":        datetime.now(EST).strftime("%Y-%m-%d"),
+            }
+            reminders.append(reminder)
+            save_reminders(reminders)
+
+            msg  = f"✅ *Reminder Set!*\n\n"
+            msg += f"{'🟢' if action == 'BUY' else '🔴'} {action} *{ticker}* @ ${target_price:.2f}\n"
+            if current:
+                diff = ((current - target_price) / target_price * 100)
+                msg += f"Current price: ${current:.2f} ({diff:+.1f}% away)\n"
+            if remind_date:
+                msg += f"Date: {remind_date}\n"
+            msg += f"\nI'll alert you in the Reminders section above Option Hunter. 🔔"
+            await update.message.reply_text(msg, parse_mode="Markdown")
+            return
+
+        # Analysis mode: /remind TICKER
+        await update.message.reply_text(f"🔍 Analyzing *{ticker}*... (~15 seconds)", parse_mode="Markdown")
+
+        analysis = analyze_for_reminder(ticker)
+        if not analysis:
+            await update.message.reply_text(f"❌ Could not fetch data for {ticker}. Check the ticker symbol.")
+            return
+
+        a = analysis
+        msg  = f"📊 *{ticker} ANALYSIS*\n\n"
+        msg += f"Price: ${a['price']:.2f} | Score: {a['score']:+d}/6\n"
+        msg += f"Verdict: {a['verdict']}\n"
+        if a['rsi']:
+            msg += f"RSI: {a['rsi']} | "
+        msg += f"\n💡 {a['suggestion']}\n\n"
+
+        if a['earn_warning']:
+            msg += f"{a['earn_warning']}\n\n"
+
+        msg += "Top signals:\n"
+        for d in a['details'][:4]:
+            msg += f"  {d}\n"
+
+        msg += f"\n━━━━━━━━━━━━━━━━━━━━\n"
+        msg += f"Want to set a reminder?\n\n"
+        msg += f"📅 *By date:*\n`/remind {ticker} {a['action']} {a['price']:.2f} YYYY-MM-DD`\n\n"
+        msg += f"💰 *By price:*\n`/remind {ticker} {a['action']} {a['price']:.2f}`\n\n"
+        msg += f"_Replace date/price with your target_"
+
+        await update.message.reply_text(msg, parse_mode="Markdown")
+
+    except ValueError:
+        await update.message.reply_text("❌ Invalid price. Example: `/remind NVDA BUY 190.00`", parse_mode="Markdown")
+    except Exception as e:
+        logger.error(f"cmd_remind error: {e}")
+        await update.message.reply_text(f"❌ Error: {e}")
+
+
+async def cmd_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/reminders — show and manage all active reminders"""
+    if not reminders:
+        await update.message.reply_text(
+            "📅 No reminders set.\n\nUse `/remind TICKER` to add one.",
+            parse_mode="Markdown"
+        )
+        return
+
+    msg = "🔔 *YOUR REMINDERS*\n\n"
+    for i, r in enumerate(reminders, 1):
+        ticker = r["ticker"]
+        action = r["action"]
+        emoji  = "🟢" if action == "BUY" else "🔴"
+
+        if r.get("target_price"):
+            msg += f"{i}. {emoji} {action} *{ticker}* @ ${float(r['target_price']):.2f}"
+        if r.get("remind_date"):
+            msg += f" | 📅 {r['remind_date']}"
+        if r.get("note"):
+            msg += f"\n   _{r['note']}_"
+        msg += "\n\n"
+
+    msg += "━━━━━━━━━━━━━━━━━━━━\n"
+    msg += "To delete: `/delreminder 1` (use number above)\n"
+    msg += "To add: `/remind TICKER`"
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
+
+async def cmd_delreminder(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/delreminder N — delete reminder by number"""
+    try:
+        if not context.args:
+            await update.message.reply_text("Usage: `/delreminder 1`", parse_mode="Markdown")
+            return
+        idx = int(context.args[0]) - 1
+        if idx < 0 or idx >= len(reminders):
+            await update.message.reply_text(f"❌ No reminder #{idx+1}. Use /reminders to see the list.")
+            return
+        removed = reminders.pop(idx)
+        save_reminders(reminders)
+        await update.message.reply_text(
+            f"✅ Deleted: {removed['action']} {removed['ticker']} reminder.",
+            parse_mode="Markdown"
+        )
+    except ValueError:
+        await update.message.reply_text("❌ Use a number. Example: `/delreminder 1`", parse_mode="Markdown")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {e}")
 
 
 async def cmd_buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1494,26 +1838,25 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 🤖 *Trading Bot Commands*
 
 *Portfolio Management:*
-/buy TICKER SHARES PRICE
-  → e.g. `/buy NVDA 10 201.50`
-  → Adds position, recalculates avg cost
+/buy TICKER SHARES PRICE → add position
+/sell TICKER SHARES PRICE → reduce position
+/portfolio → live P&L snapshot
 
-/sell TICKER SHARES PRICE
-  → e.g. `/sell RKLB 20 85.00`
-  → Reduces position, shows realised P&L
-
-/portfolio
-  → Shows all holdings with live P&L
+*Reminders:*
+/remind TICKER → analyze stock + offer reminder
+/remind TICKER BUY 190.00 → set price alert
+/remind TICKER SELL 220.00 2026-05-15 → price+date
+/reminders → see all active reminders
+/delreminder 1 → delete reminder #1
 
 *Manual Triggers:*
-/scan
-  → Run Option Hunter + Swing scan now
+/scan → Option Hunter + Swing Trades now
+/vix → current fear index
 
-/vix
-  → Check current VIX level
-
-/help
-  → Show this message
+*Settings:*
+/capital 3000 → update swing capital
+/setup → redo setup wizard
+/help → this message
     """
     await update.message.reply_text(msg, parse_mode="Markdown")
 
@@ -1610,12 +1953,30 @@ def main():
     # ── Telegram Application (main thread — listens for commands) ─────────────
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    app.add_handler(CommandHandler("buy",       cmd_buy))
-    app.add_handler(CommandHandler("sell",      cmd_sell))
-    app.add_handler(CommandHandler("portfolio", cmd_portfolio))
-    app.add_handler(CommandHandler("scan",      cmd_scan))
-    app.add_handler(CommandHandler("vix",       cmd_vix))
-    app.add_handler(CommandHandler("help",      cmd_help))
+    # Setup wizard
+    app.add_handler(CommandHandler("start",       cmd_start))
+    app.add_handler(CommandHandler("setup",       cmd_setup))
+    app.add_handler(CommandHandler("done",        cmd_done))
+    app.add_handler(CommandHandler("capital",     cmd_capital))
+
+    # Portfolio management
+    app.add_handler(CommandHandler("buy",         cmd_buy))
+    app.add_handler(CommandHandler("sell",        cmd_sell))
+    app.add_handler(CommandHandler("portfolio",   cmd_portfolio))
+
+    # Reminders
+    app.add_handler(CommandHandler("remind",      cmd_remind))
+    app.add_handler(CommandHandler("reminders",   cmd_reminders))
+    app.add_handler(CommandHandler("delreminder", cmd_delreminder))
+
+    # Scans & info
+    app.add_handler(CommandHandler("scan",        cmd_scan))
+    app.add_handler(CommandHandler("vix",         cmd_vix))
+    app.add_handler(CommandHandler("help",        cmd_help))
+
+    # Free text handler (wizard replies)
+    from telegram.ext import MessageHandler, filters
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     logger.info("🤖 Bot listening for commands...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
