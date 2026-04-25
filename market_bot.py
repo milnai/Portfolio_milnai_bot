@@ -128,27 +128,29 @@ WATCHLIST_FILE  = "watchlist.json"
 SETTINGS_FILE   = "settings.json"
 REMINDERS_FILE  = "reminders.json"
 ALERT_STATE_FILE = "alert_state.json"   # Tracks last alert per ticker for dedup
+PLAYBOOK_FILE    = "playbook.json"       # Trade Playbook entries
 
-# --- Default portfolio (Apr 24 2026) ---
+# --- Default portfolio (Apr 25 2026) ---
 DEFAULT_PORTFOLIO = {
-    "RKLB_stock":            {"asset_type": "stock",  "ticker": "RKLB",  "shares": 67,  "avg_cost": 68.439,  "entry_date": "2025-01-01", "strike": None, "expiry": None, "contracts": None},
-    "NVDA_stock":            {"asset_type": "stock",  "ticker": "NVDA",  "shares": 10,  "avg_cost": 175.90,  "entry_date": "2025-01-01", "strike": None, "expiry": None, "contracts": None},
-    "NVDA_call_200_20260618":{"asset_type": "call",   "ticker": "NVDA",  "shares": None,"avg_cost": 12.00,   "entry_date": "2026-04-24", "strike": 200.0,"expiry": "2026-06-18","contracts": 1},
-    "ALAB_stock":            {"asset_type": "stock",  "ticker": "ALAB",  "shares": 2,   "avg_cost": 116.00,  "entry_date": "2025-01-01", "strike": None, "expiry": None, "contracts": None},
-    "NVDL_stock":            {"asset_type": "stock",  "ticker": "NVDL",  "shares": 10,  "avg_cost": 80.90,   "entry_date": "2025-01-01", "strike": None, "expiry": None, "contracts": None},
-    "AMZN_stock":            {"asset_type": "stock",  "ticker": "AMZN",  "shares": 2,   "avg_cost": 246.99,  "entry_date": "2026-04-24", "strike": None, "expiry": None, "contracts": None},
-    "AMZN_call_270_20260515":{"asset_type": "call",   "ticker": "AMZN",  "shares": None,"avg_cost": 5.65,    "entry_date": "2026-04-24", "strike": 270.0,"expiry": "2026-05-15","contracts": 1},
-    "META_call_715_20260508": {"asset_type": "call",  "ticker": "META",  "shares": None,"avg_cost": 8.85,    "entry_date": "2026-04-24", "strike": 715.0,"expiry": "2026-05-08","contracts": 1},
-    "MSFT_stock":            {"asset_type": "stock",  "ticker": "MSFT",  "shares": 2,   "avg_cost": 372.50,  "entry_date": "2025-01-01", "strike": None, "expiry": None, "contracts": None},
-    "NBIS_stock":            {"asset_type": "stock",  "ticker": "NBIS",  "shares": 2,   "avg_cost": 114.90,  "entry_date": "2025-01-01", "strike": None, "expiry": None, "contracts": None},
-    "SCHD_stock":            {"asset_type": "stock",  "ticker": "SCHD",  "shares": 15,  "avg_cost": 30.50,   "entry_date": "2025-01-01", "strike": None, "expiry": None, "contracts": None},
-    "TSLA_stock":            {"asset_type": "stock",  "ticker": "TSLA",  "shares": 4,   "avg_cost": 375.00,  "entry_date": "2026-04-24", "strike": None, "expiry": None, "contracts": None},
-    "PANW_stock":            {"asset_type": "stock",  "ticker": "PANW",  "shares": 2,   "avg_cost": 175.00,  "entry_date": "2026-04-24", "strike": None, "expiry": None, "contracts": None},
-    "ASTS_stock":            {"asset_type": "stock",  "ticker": "ASTS",  "shares": 5,   "avg_cost": 79.80,   "entry_date": "2026-04-24", "strike": None, "expiry": None, "contracts": None},
-    "GE_stock":              {"asset_type": "stock",  "ticker": "GE",    "shares": 3,   "avg_cost": 285.33,  "entry_date": "2026-04-24", "strike": None, "expiry": None, "contracts": None},
-    "GOOGL_stock":           {"asset_type": "stock",  "ticker": "GOOGL", "shares": 2,   "avg_cost": 337.50,  "entry_date": "2026-04-24", "strike": None, "expiry": None, "contracts": None},
-    "GOOGL_call_340_20260515":{"asset_type": "call",  "ticker": "GOOGL", "shares": None,"avg_cost": 13.15,   "entry_date": "2026-04-24", "strike": 340.0,"expiry": "2026-05-15","contracts": 1},
-    "GRAB_stock":            {"asset_type": "stock",  "ticker": "GRAB",  "shares": 284, "avg_cost": 5.899,   "entry_date": "2025-01-01", "strike": None, "expiry": None, "contracts": None},
+    "RKLB_stock":            {"asset_type": "stock",  "ticker": "RKLB",  "shares": 67,  "avg_cost": 68.439,  "entry_date": "2025-01-01", "strike": None,  "expiry": None,         "contracts": None},
+    "NVDA_stock":            {"asset_type": "stock",  "ticker": "NVDA",  "shares": 10,  "avg_cost": 175.90,  "entry_date": "2025-01-01", "strike": None,  "expiry": None,         "contracts": None},
+    "NVDA_call_200_20260618":{"asset_type": "call",   "ticker": "NVDA",  "shares": None,"avg_cost": 12.00,   "entry_date": "2026-04-24", "strike": 200.0, "expiry": "2026-06-18", "contracts": 1},
+    "NVDA_call_220_20260618":{"asset_type": "call",   "ticker": "NVDA",  "shares": None,"avg_cost": 6.20,    "entry_date": "2026-04-25", "strike": 220.0, "expiry": "2026-06-18", "contracts": 1},
+    "ALAB_stock":            {"asset_type": "stock",  "ticker": "ALAB",  "shares": 2,   "avg_cost": 116.00,  "entry_date": "2025-01-01", "strike": None,  "expiry": None,         "contracts": None},
+    "NVDL_stock":            {"asset_type": "stock",  "ticker": "NVDL",  "shares": 10,  "avg_cost": 80.90,   "entry_date": "2025-01-01", "strike": None,  "expiry": None,         "contracts": None},
+    "AMZN_stock":            {"asset_type": "stock",  "ticker": "AMZN",  "shares": 2,   "avg_cost": 246.99,  "entry_date": "2026-04-24", "strike": None,  "expiry": None,         "contracts": None},
+    "AMZN_call_270_20260515":{"asset_type": "call",   "ticker": "AMZN",  "shares": None,"avg_cost": 5.65,    "entry_date": "2026-04-24", "strike": 270.0, "expiry": "2026-05-15", "contracts": 1},
+    "META_call_715_20260508":{"asset_type": "call",   "ticker": "META",  "shares": None,"avg_cost": 8.85,    "entry_date": "2026-04-24", "strike": 715.0, "expiry": "2026-05-08", "contracts": 1},
+    "MSFT_stock":            {"asset_type": "stock",  "ticker": "MSFT",  "shares": 2,   "avg_cost": 372.50,  "entry_date": "2025-01-01", "strike": None,  "expiry": None,         "contracts": None},
+    "NBIS_stock":            {"asset_type": "stock",  "ticker": "NBIS",  "shares": 2,   "avg_cost": 131.95,  "entry_date": "2025-01-01", "strike": None,  "expiry": None,         "contracts": None},
+    "SCHD_stock":            {"asset_type": "stock",  "ticker": "SCHD",  "shares": 15,  "avg_cost": 30.50,   "entry_date": "2025-01-01", "strike": None,  "expiry": None,         "contracts": None},
+    "TSLA_stock":            {"asset_type": "stock",  "ticker": "TSLA",  "shares": 4,   "avg_cost": 375.00,  "entry_date": "2026-04-24", "strike": None,  "expiry": None,         "contracts": None},
+    "PANW_stock":            {"asset_type": "stock",  "ticker": "PANW",  "shares": 2,   "avg_cost": 175.00,  "entry_date": "2026-04-24", "strike": None,  "expiry": None,         "contracts": None},
+    "ASTS_stock":            {"asset_type": "stock",  "ticker": "ASTS",  "shares": 5,   "avg_cost": 79.80,   "entry_date": "2026-04-24", "strike": None,  "expiry": None,         "contracts": None},
+    "GE_stock":              {"asset_type": "stock",  "ticker": "GE",    "shares": 3,   "avg_cost": 285.33,  "entry_date": "2026-04-24", "strike": None,  "expiry": None,         "contracts": None},
+    "GOOGL_stock":           {"asset_type": "stock",  "ticker": "GOOGL", "shares": 2,   "avg_cost": 337.50,  "entry_date": "2026-04-24", "strike": None,  "expiry": None,         "contracts": None},
+    "GOOGL_call_340_20260515":{"asset_type": "call",  "ticker": "GOOGL", "shares": None,"avg_cost": 13.15,   "entry_date": "2026-04-24", "strike": 340.0, "expiry": "2026-05-15", "contracts": 1},
+    "GRAB_stock":            {"asset_type": "stock",  "ticker": "GRAB",  "shares": 284, "avg_cost": 5.899,   "entry_date": "2025-01-01", "strike": None,  "expiry": None,         "contracts": None},
 }
 
 DEFAULT_WATCHLIST = [
@@ -175,24 +177,24 @@ DEFAULT_WATCHLIST = [
 ]
 
 EARNINGS_CALENDAR = {
-    "PLTR":  "2026-05-04",
-    "RKLB":  "2026-05-13",
-    "AMD":   "2026-05-05",
-    "NVDA":  "2026-05-28",
-    "AXON":  "2026-05-06",
-    "CRWV":  "2026-05-14",
-    "NBIS":  "2026-05-12",
-    "HIMS":  "2026-05-05",
-    "TSLA":  "2026-07-22",
-    "NFLX":  "2026-07-16",
-    "META":  "2026-04-30",
+    # --- Passed (kept for reference, bot ignores past dates automatically) ---
+    # GOOGL: Apr 29 2026 (passed), META: Apr 30 2026 (passed), MSFT: Apr 30 2026 (passed), GE: Apr 22 2026 (passed)
+
+    # --- Upcoming ---
     "AMZN":  "2026-05-01",
     "AAPL":  "2026-05-01",
-    "MSFT":  "2026-04-30",
-    "GOOGL": "2026-04-29",
-    "PANW":  "2026-05-20",
+    "PLTR":  "2026-05-04",
+    "AMD":   "2026-05-05",
+    "HIMS":  "2026-05-05",
+    "AXON":  "2026-05-06",
     "ASTS":  "2026-05-08",
-    "GE":    "2026-04-22",
+    "NBIS":  "2026-05-12",
+    "RKLB":  "2026-05-13",
+    "CRWV":  "2026-05-14",
+    "PANW":  "2026-05-20",
+    "NVDA":  "2026-05-28",
+    "NFLX":  "2026-07-16",
+    "TSLA":  "2026-07-22",
 }
 
 
@@ -254,12 +256,19 @@ def load_alert_state():
 def save_alert_state(s):
     save_json(ALERT_STATE_FILE, s)
 
+def load_playbook():
+    return load_json(PLAYBOOK_FILE, [])
+
+def save_playbook(p):
+    save_json(PLAYBOOK_FILE, p)
+
 # Live state
 live_portfolio = load_portfolio()
 live_watchlist = load_watchlist()
 user_settings  = load_settings()
 reminders      = load_reminders()
 alert_state    = load_alert_state()  # {ticker: last_alert_iso_timestamp}
+live_playbook  = load_playbook()     # [{date, ticker, action, price_range, reason, urgency}]
 
 
 # ============================================================================
@@ -1546,6 +1555,576 @@ def format_reminders_section():
     return msg
 
 
+    return msg
+
+
+# ============================================================================
+# TRADE PLAYBOOK
+# Stores forward-looking trade reminders with date, action, price target, reason.
+# Fires daily at 8am SGT as a morning briefing.
+# Entry schema:
+#   {
+#     "id": 1,
+#     "date": "2026-05-01",       # YYYY-MM-DD or "ongoing"
+#     "ticker": "AMZN",
+#     "action": "SELL",           # BUY | SELL | WATCH
+#     "asset_type": "call",       # stock | call | put
+#     "price_from": 8.00,         # sell/buy at this price or above/below
+#     "price_to": 12.00,          # optional upper end of range
+#     "strike": 270.0,            # options only
+#     "expiry": "2026-05-15",     # options only
+#     "contracts": 1,
+#     "reason": "IV crush post-earnings — sell before report",
+#     "urgency": "high"           # high | medium | low
+#   }
+# ============================================================================
+
+def _next_playbook_id():
+    return max((e.get("id", 0) for e in live_playbook), default=0) + 1
+
+
+# ============================================================================
+# AUTO-POPULATE PLAYBOOK
+# ============================================================================
+
+def auto_populate_playbook():
+    """
+    Generate playbook entries automatically from:
+      1. Portfolio options  -> sell signals based on expiry, earnings, P&L
+      2. Portfolio stocks   -> buy-more signals on pullback to support
+      3. Watchlist earnings -> watch/buy signals ahead of catalyst
+    Auto entries are flagged with "auto": True so manual ones are preserved.
+    """
+    entries  = []
+    today    = datetime.now(EST).date()
+    entry_id = 1000  # Auto entries start at 1000
+
+    def make(ticker, action, asset_type, date_str, price_from, price_to,
+             reason, urgency, strike=None, expiry=None, contracts=1):
+        nonlocal entry_id
+        e = {
+            "id":         entry_id,
+            "date":       date_str,
+            "ticker":     ticker,
+            "action":     action,
+            "asset_type": asset_type,
+            "price_from": round(price_from, 2),
+            "price_to":   round(price_to, 2) if price_to else None,
+            "strike":     strike,
+            "expiry":     expiry,
+            "contracts":  contracts,
+            "reason":     reason,
+            "urgency":    urgency,
+            "auto":       True,
+            "added":      today.strftime("%Y-%m-%d"),
+        }
+        entry_id += 1
+        return e
+
+    # 1. Portfolio Options
+    for key, pos in get_option_positions().items():
+        ticker    = pos["ticker"]
+        strike    = pos["strike"]
+        expiry    = pos["expiry"]
+        contracts = pos["contracts"] or 1
+        avg_cost  = pos["avg_cost"]
+        atype     = pos["asset_type"]
+
+        if not expiry:
+            continue
+        try:
+            exp_date = datetime.strptime(expiry, "%Y-%m-%d").date()
+            dte      = (exp_date - today).days
+        except:
+            continue
+
+        if dte < 0:
+            entries.append(make(
+                ticker, "SELL", atype, today.strftime("%Y-%m-%d"),
+                0.01, None,
+                f"EXPIRED — ${strike:.0f} {atype.upper()} {expiry}. Remove from portfolio with /delete",
+                "high", strike, expiry, contracts
+            ))
+            continue
+
+        data        = get_stock_data(ticker)
+        stock_price = data["current_price"] if data else None
+        opt_val     = get_option_value(pos, stock_price) if stock_price else None
+        live_prem   = opt_val.get("live_premium") if opt_val else None
+        pnl_pct     = opt_val.get("pnl_pct", 0) if opt_val else 0
+
+        # Earnings before expiry?
+        earn_date_str   = EARNINGS_CALENDAR.get(ticker)
+        earn_before_exp = False
+        earn_days_away  = None
+        earn_date_obj   = None
+        if earn_date_str:
+            try:
+                earn_date_obj  = datetime.strptime(earn_date_str, "%Y-%m-%d").date()
+                earn_days_away = (earn_date_obj - today).days
+                earn_before_exp = 0 <= earn_days_away <= dte
+            except:
+                pass
+
+        # Rule A: Sell before earnings (IV crush)
+        if earn_before_exp and earn_days_away is not None and earn_days_away >= 0:
+            sell_by     = (earn_date_obj - timedelta(days=1)).strftime("%Y-%m-%d")
+            sell_floor  = round(avg_cost * 1.10, 2)
+            sell_target = round(avg_cost * 1.50, 2)
+            urgency     = "high" if earn_days_away <= 3 else "medium"
+            entries.append(make(
+                ticker, "SELL", atype, sell_by,
+                sell_floor, sell_target,
+                f"Sell BEFORE {ticker} earnings {earn_date_str} — IV crushes after report. "
+                f"Entry ${avg_cost:.2f}. Target +10% to +50% on premium.",
+                urgency, strike, expiry, contracts
+            ))
+
+        # Rule B: Close to expiry — time decay accelerating
+        elif dte <= 14:
+            urgency    = "high" if dte <= 7 else "medium"
+            sell_floor = round(avg_cost * 0.80, 2)
+            sell_ceil  = round(avg_cost * 1.30, 2)
+            entries.append(make(
+                ticker, "SELL", atype,
+                (today + timedelta(days=min(3, dte - 1))).strftime("%Y-%m-%d"),
+                sell_floor, sell_ceil,
+                f"{dte} days to expiry — time decay accelerating. "
+                f"Sell to recover value. Entry ${avg_cost:.2f}/share.",
+                urgency, strike, expiry, contracts
+            ))
+
+        # Rule C: Big profit — lock in gains
+        elif live_prem and pnl_pct >= 50:
+            sell_floor = round(live_prem * 0.85, 2)
+            sell_ceil  = round(live_prem * 1.20, 2)
+            entries.append(make(
+                ticker, "SELL", atype, "ongoing",
+                sell_floor, sell_ceil,
+                f"Up {pnl_pct:+.0f}% — lock in profits. "
+                f"Sell half at ~${live_prem:.2f}, let rest run.",
+                "medium", strike, expiry, contracts
+            ))
+
+        # Rule D: Hold and monitor
+        else:
+            watch_low  = round(avg_cost * 1.20, 2)
+            watch_high = round(avg_cost * 2.00, 2)
+            entries.append(make(
+                ticker, "WATCH", atype, "ongoing",
+                watch_low, watch_high,
+                f"${strike:.0f} {atype.upper()} {expiry} ({dte}DTE). Entry ${avg_cost:.2f}. "
+                f"Sell between ${watch_low:.2f}–${watch_high:.2f} (+20% to +100%). "
+                f"Exit latest 7 days before expiry.",
+                "low", strike, expiry, contracts
+            ))
+
+    # 2. Portfolio Stocks — add on pullback
+    for key, pos in get_stock_positions().items():
+        ticker   = pos["ticker"]
+        avg_cost = pos["avg_cost"]
+        try:
+            data = get_stock_data(ticker)
+            if not data:
+                continue
+            price  = data["current_price"]
+            scored = score_ticker(data)
+            if not scored:
+                continue
+            bb      = scored.get("bb")
+            rsi     = scored.get("rsi")
+            score   = scored["score"]
+            pnl_pct = ((price - avg_cost) / avg_cost * 100) if avg_cost else 0
+            if score >= BUY_MEDIUM and rsi and rsi < 65 and pnl_pct < 25:
+                buy_low  = round(bb["lower"], 2) if bb else round(price * 0.97, 2)
+                buy_high = round(bb["lower"] * 1.02, 2) if bb else round(price * 0.99, 2)
+                entries.append(make(
+                    ticker, "BUY", "stock", "ongoing",
+                    buy_low, buy_high,
+                    f"Score {score}/6 — bullish. Add shares on pullback to "
+                    f"${buy_low:.2f}–${buy_high:.2f} (BB lower). Current P&L: {pnl_pct:+.1f}%.",
+                    "low"
+                ))
+        except Exception as e:
+            logger.warning(f"Auto playbook stock {ticker}: {e}")
+
+    # 3. Watchlist Earnings — catalyst plays
+    for ticker, earn_date_str in EARNINGS_CALENDAR.items():
+        if any(v["ticker"] == ticker for v in live_portfolio.values()):
+            continue
+        if ticker not in live_watchlist:
+            continue
+        try:
+            earn_date_obj  = datetime.strptime(earn_date_str, "%Y-%m-%d").date()
+            earn_days_away = (earn_date_obj - today).days
+            if earn_days_away < 0 or earn_days_away > 14:
+                continue
+            data = get_stock_data(ticker)
+            if not data:
+                continue
+            price  = data["current_price"]
+            scored = score_ticker(data)
+            score  = scored["score"] if scored else 0
+            if score >= BUY_MEDIUM:
+                buy_low  = round(price * 0.97, 2)
+                buy_high = round(price * 0.99, 2)
+                entries.append(make(
+                    ticker, "BUY", "stock",
+                    (earn_date_obj - timedelta(days=1)).strftime("%Y-%m-%d"),
+                    buy_low, buy_high,
+                    f"Earnings {earn_date_str} in {earn_days_away}d. Score {score}/6 bullish. "
+                    f"Buy dip ${buy_low:.2f}–${buy_high:.2f} before report. "
+                    f"Size small — earnings binary event (max 1% capital).",
+                    "medium" if earn_days_away > 3 else "high"
+                ))
+        except Exception as e:
+            logger.warning(f"Auto playbook watchlist {ticker}: {e}")
+
+    logger.info(f"📋 Auto-playbook: {len(entries)} entries generated")
+    return entries
+
+
+def refresh_auto_playbook():
+    """Replace auto entries with fresh ones, preserve manual entries."""
+    global live_playbook
+    manual        = [e for e in live_playbook if not e.get("auto", False)]
+    auto          = auto_populate_playbook()
+    live_playbook = manual + auto
+    save_playbook(live_playbook)
+    logger.info(f"📋 Playbook: {len(manual)} manual + {len(auto)} auto = {len(live_playbook)} total")
+
+
+def format_playbook_briefing(show_all=False):
+    """
+    Format the daily Trade Playbook briefing.
+    Shows: overdue (missed), today, next 7 days, then ongoing entries.
+    Clear BUY / SELL / WATCH with price targets and reason.
+    """
+    if not live_playbook:
+        return None
+
+    today   = datetime.now(EST).date()
+    t       = _time_display()
+
+    overdue, due_today, upcoming, ongoing = [], [], [], []
+
+    for entry in live_playbook:
+        d = entry.get("date", "ongoing")
+        if d == "ongoing":
+            ongoing.append(entry)
+            continue
+        try:
+            entry_date = datetime.strptime(d, "%Y-%m-%d").date()
+            days_away  = (entry_date - today).days
+            if days_away < 0:
+                overdue.append((days_away, entry))
+            elif days_away == 0:
+                due_today.append(entry)
+            elif days_away <= 7:
+                upcoming.append((days_away, entry))
+            elif show_all:
+                upcoming.append((days_away, entry))
+        except:
+            ongoing.append(entry)
+
+    # If nothing relevant, return None (don't send empty briefing)
+    if not overdue and not due_today and not upcoming and not ongoing:
+        return None
+
+    msg  = "📋 *TRADE PLAYBOOK*\n"
+    msg += f"_{t['sgt']} | {t['est']}_\n\n"
+
+    def _entry_line(entry, days_away=None):
+        action      = entry.get("action", "WATCH")
+        ticker      = entry.get("ticker", "")
+        asset_type  = entry.get("asset_type", "stock")
+        price_from  = entry.get("price_from")
+        price_to    = entry.get("price_to")
+        strike      = entry.get("strike")
+        expiry      = entry.get("expiry")
+        contracts   = entry.get("contracts", 1)
+        reason      = entry.get("reason", "")
+        urgency     = entry.get("urgency", "medium")
+
+        # Action emoji
+        action_emoji = "🟢 BUY" if action == "BUY" else ("🔴 SELL" if action == "SELL" else "👁 WATCH")
+        urgency_tag  = " ⚡" if urgency == "high" else (" 🕐" if urgency == "medium" else "")
+
+        # Asset label
+        if asset_type in ("call", "put"):
+            strike_str = f" ${strike:.0f}" if strike else ""
+            expiry_str = f" {expiry}" if expiry else ""
+            ct_str     = f" {contracts}ct" if contracts else ""
+            asset_label = f"{ticker}{strike_str} {asset_type.upper()}{expiry_str}{ct_str}"
+        else:
+            asset_label = f"{ticker} stock"
+
+        # Price target
+        if price_from and price_to:
+            price_str = f"${price_from:.2f}–${price_to:.2f}"
+        elif price_from:
+            price_str = f"${price_from:.2f}"
+        else:
+            price_str = "—"
+
+        line  = f"{action_emoji}{urgency_tag}: *{asset_label}*\n"
+        line += f"   Price: {price_str}"
+        if action == "BUY":
+            line += f" ← buy at or below this\n"
+        elif action == "SELL":
+            line += f" ← sell at or above this\n"
+        else:
+            line += "\n"
+        line += f"   Why: {reason}\n"
+        return line
+
+    # Overdue
+    if overdue:
+        msg += "⚠️ *OVERDUE — Take action:*\n"
+        for days_away, e in sorted(overdue):
+            msg += f"_{e['date']} ({abs(days_away)}d ago)_\n"
+            msg += _entry_line(e, days_away)
+            msg += "\n"
+
+    # Today
+    if due_today:
+        msg += "🔔 *TODAY:*\n"
+        for e in due_today:
+            msg += _entry_line(e, 0)
+            msg += "\n"
+
+    # Upcoming (next 7 days)
+    if upcoming:
+        msg += "📅 *UPCOMING (next 7 days):*\n"
+        for days_away, e in sorted(upcoming):
+            day_label = f"Tomorrow" if days_away == 1 else f"In {days_away} days ({e['date']})"
+            msg += f"_{day_label}_\n"
+            msg += _entry_line(e, days_away)
+            msg += "\n"
+
+    # Ongoing (no date)
+    if ongoing:
+        msg += "🔄 *ONGOING (no deadline):*\n"
+        for e in ongoing:
+            msg += _entry_line(e)
+            msg += "\n"
+
+    msg += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+    msg += "_/playbook to manage | /playbook add to add new entry_"
+    return msg
+
+
+async def cmd_playbook(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /playbook                         — show today's briefing
+    /playbook view                    — show all entries
+    /playbook add                     — interactive guide
+    /playbook add TICKER ACTION DATE PRICE_FROM [PRICE_TO] [REASON]
+    /playbook delete N                — delete entry by number
+    /playbook done N                  — mark entry complete and remove
+
+    ACTION = BUY | SELL | WATCH
+    DATE   = YYYY-MM-DD | ongoing
+
+    Examples (stocks):
+      /playbook add TSLA BUY 2026-05-01 370 380 Buy if dips on earnings
+      /playbook add NVDA WATCH ongoing 195 200 Wait for pullback to add
+
+    Examples (options — append: call|put STRIKE EXPIRY CONTRACTS):
+      /playbook add AMZN SELL 2026-05-01 8.00 12.00 call 270 2026-05-15 1 Sell before earnings IV crush
+      /playbook add RKLB BUY ongoing 5.00 8.00 call 86 2026-06-18 1 Buy on dip for Neutron catalyst
+    """
+    global live_playbook
+
+    args = context.args or []
+    sub  = args[0].lower() if args else "view_today"
+
+    # ── /playbook refresh ─────────────────────────────────────────────────────
+    if sub == "refresh":
+        await update.message.reply_text("🔄 Refreshing auto playbook entries... (~30 sec)")
+        try:
+            refresh_auto_playbook()
+            auto_count   = sum(1 for e in live_playbook if e.get("auto"))
+            manual_count = sum(1 for e in live_playbook if not e.get("auto"))
+            await update.message.reply_text(
+                f"✅ Playbook refreshed!\n"
+                f"Auto entries: {auto_count} | Manual entries: {manual_count}\n\n"
+                f"Use `/playbook view` to see all entries.",
+                parse_mode="Markdown"
+            )
+        except Exception as e:
+            await update.message.reply_text(f"❌ Refresh failed: {e}")
+        return
+
+    # ── /playbook  or  /playbook view ─────────────────────────────────────────
+    if sub in ("view_today", "view"):
+        show_all = (sub == "view")
+        if not live_playbook:
+            await update.message.reply_text(
+                "📋 *Trade Playbook is empty.*\n\nAdd entries with:\n"
+                "`/playbook add TICKER ACTION DATE PRICE_FROM`\n\n"
+                "Example:\n`/playbook add AMZN SELL 2026-05-01 8.00 Sell call before earnings`",
+                parse_mode="Markdown"
+            )
+            return
+        msg = format_playbook_briefing(show_all=show_all)
+        if not msg:
+            await update.message.reply_text("📋 No playbook entries due today or in the next 7 days.\n\nUse `/playbook view` to see all.", parse_mode="Markdown")
+        else:
+            # Also show numbered list for easy deletion
+            numbered = "\n*All entries:*\n"
+            for i, e in enumerate(live_playbook, 1):
+                d = e.get("date", "ongoing")
+                a = e.get("action", "WATCH")
+                tk = e.get("ticker", "")
+                pr = f"${e['price_from']:.2f}" if e.get("price_from") else ""
+                numbered += f"{i}. {a} {tk} {pr} [{d}]\n"
+            numbered += "\n_/playbook delete N to remove_"
+            await update.message.reply_text(msg + numbered, parse_mode="Markdown")
+        return
+
+    # ── /playbook delete N ─────────────────────────────────────────────────────
+    if sub in ("delete", "done", "remove"):
+        try:
+            idx = int(args[1]) - 1
+            if idx < 0 or idx >= len(live_playbook):
+                await update.message.reply_text(f"❌ No entry #{idx+1}. Use `/playbook view` to see the list.", parse_mode="Markdown")
+                return
+            removed = live_playbook.pop(idx)
+            save_playbook(live_playbook)
+            tk  = removed.get("ticker", "")
+            act = removed.get("action", "")
+            await update.message.reply_text(f"✅ Removed: *{act} {tk}* from playbook.", parse_mode="Markdown")
+        except (IndexError, ValueError):
+            await update.message.reply_text("❌ Usage: `/playbook delete 1`", parse_mode="Markdown")
+        return
+
+    # ── /playbook add ... ──────────────────────────────────────────────────────
+    if sub == "add":
+        if len(args) < 5:
+            await update.message.reply_text(
+                "📋 *Add to Playbook:*\n\n"
+                "*Stocks:*\n"
+                "`/playbook add TICKER ACTION DATE PRICE_FROM [PRICE_TO] [REASON]`\n\n"
+                "*Options:*\n"
+                "`/playbook add TICKER ACTION DATE PRICE_FROM PRICE_TO call|put STRIKE EXPIRY CONTRACTS [REASON]`\n\n"
+                "*Examples:*\n"
+                "`/playbook add TSLA BUY 2026-05-01 370 380 Buy on earnings dip`\n"
+                "`/playbook add AMZN SELL 2026-05-01 8.00 12.00 call 270 2026-05-15 1 Sell before IV crush`\n"
+                "`/playbook add NVDA BUY ongoing 190 200 Add shares on pullback`\n\n"
+                "DATE can be `YYYY-MM-DD` or `ongoing`\n"
+                "ACTION = `BUY` | `SELL` | `WATCH`",
+                parse_mode="Markdown"
+            )
+            return
+
+        try:
+            ticker     = args[1].upper()
+            action     = args[2].upper()
+            date_str   = args[3]           # YYYY-MM-DD or "ongoing"
+            price_from = float(args[4])
+
+            if action not in ("BUY", "SELL", "WATCH"):
+                await update.message.reply_text("❌ ACTION must be BUY, SELL, or WATCH.")
+                return
+
+            # Validate date
+            if date_str != "ongoing":
+                datetime.strptime(date_str, "%Y-%m-%d")  # raises if invalid
+
+            # Parse optional fields — detect if next arg is a number (price_to) or option type
+            idx    = 5
+            price_to    = None
+            asset_type  = "stock"
+            strike      = None
+            expiry      = None
+            contracts   = 1
+            reason_parts = []
+
+            # price_to (optional number)
+            if idx < len(args):
+                try:
+                    price_to = float(args[idx])
+                    idx += 1
+                except ValueError:
+                    pass
+
+            # option type (call/put)
+            if idx < len(args) and args[idx].lower() in ("call", "put"):
+                asset_type = args[idx].lower()
+                idx += 1
+                # strike
+                if idx < len(args):
+                    strike = float(args[idx]); idx += 1
+                # expiry
+                if idx < len(args):
+                    expiry = args[idx]; idx += 1
+                # contracts
+                if idx < len(args):
+                    try:
+                        contracts = int(args[idx]); idx += 1
+                    except ValueError:
+                        pass
+
+            # remainder = reason
+            reason_parts = args[idx:]
+            reason = " ".join(reason_parts) if reason_parts else "—"
+
+            # Auto urgency based on date proximity
+            if date_str == "ongoing":
+                urgency = "low"
+            else:
+                days = (datetime.strptime(date_str, "%Y-%m-%d").date() - datetime.now(EST).date()).days
+                urgency = "high" if days <= 2 else ("medium" if days <= 7 else "low")
+
+            entry = {
+                "id":         _next_playbook_id(),
+                "date":       date_str,
+                "ticker":     ticker,
+                "action":     action,
+                "asset_type": asset_type,
+                "price_from": price_from,
+                "price_to":   price_to,
+                "strike":     strike,
+                "expiry":     expiry,
+                "contracts":  contracts,
+                "reason":     reason,
+                "urgency":    urgency,
+                "added":      datetime.now(EST).strftime("%Y-%m-%d"),
+            }
+            live_playbook.append(entry)
+            save_playbook(live_playbook)
+
+            # Confirm message
+            action_emoji = "🟢" if action == "BUY" else ("🔴" if action == "SELL" else "👁")
+            price_str    = f"${price_from:.2f}–${price_to:.2f}" if price_to else f"${price_from:.2f}"
+            if asset_type in ("call", "put"):
+                asset_label = f"{ticker} ${strike:.0f} {asset_type.upper()} {expiry} {contracts}ct"
+            else:
+                asset_label = f"{ticker} stock"
+
+            msg  = f"✅ *Added to Playbook!*\n\n"
+            msg += f"{action_emoji} {action}: *{asset_label}*\n"
+            msg += f"Date: {date_str} | Price: {price_str}\n"
+            msg += f"Why: {reason}\n"
+            msg += f"Urgency: {urgency}\n\n"
+            msg += "_You'll see this in your morning briefing at 8am SGT._"
+            await update.message.reply_text(msg, parse_mode="Markdown")
+
+        except ValueError as e:
+            await update.message.reply_text(f"❌ Invalid input: {e}\n\nExample: `/playbook add TSLA BUY 2026-05-01 370 380 Buy on earnings dip`", parse_mode="Markdown")
+        except Exception as e:
+            logger.error(f"cmd_playbook add: {e}")
+            await update.message.reply_text(f"❌ Error: {e}")
+        return
+
+    # Unknown subcommand
+    await update.message.reply_text(
+        "Usage: `/playbook` | `/playbook view` | `/playbook add ...` | `/playbook delete N`",
+        parse_mode="Markdown"
+    )
+
+
 # ============================================================================
 # TELEGRAM SENDER
 # ============================================================================
@@ -1582,6 +2161,29 @@ def _run_all_signals(vix, stock_cache=None):
     wl_stocks          = run_watchlist_signals(vix)
     wl_options         = run_watchlist_options(vix)
     return protection, growth, wl_stocks, wl_options
+
+
+def job_playbook_briefing():
+    """
+    Daily Trade Playbook briefing — 8am SGT (midnight ET).
+    Also refreshes auto-entries every Sunday so the week starts fresh.
+    """
+    logger.info("📋 Playbook briefing running...")
+    try:
+        # Refresh auto entries every Sunday (weekday 6) or if playbook is empty
+        day_of_week = datetime.now(EST).weekday()  # 0=Mon, 6=Sun
+        if day_of_week == 6 or not any(e.get("auto") for e in live_playbook):
+            logger.info("📋 Refreshing auto playbook entries...")
+            refresh_auto_playbook()
+
+        msg = format_playbook_briefing(show_all=False)
+        if msg:
+            send_telegram(msg)
+            logger.info("✅ Playbook briefing sent")
+        else:
+            logger.info("✅ Playbook: nothing due today or this week")
+    except Exception as e:
+        logger.error(f"job_playbook_briefing: {e}")
 
 
 def job_premarket_scan():
@@ -2233,6 +2835,12 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/remind TICKER BUY|SELL PRICE [DATE]\n"
         "/reminders — view all alerts\n"
         "/delreminder N — delete alert #N\n\n"
+        "*Trade Playbook:*\n"
+        "/playbook — today's briefing (8am SGT daily)\n"
+        "/playbook refresh — regenerate auto entries now\n"
+        "/playbook add TICKER ACTION DATE PRICE [details]\n"
+        "/playbook view — all entries\n"
+        "/playbook delete N — remove entry\n\n"
         "*Settings:*\n"
         "/capital AMOUNT — set capital budget\n"
         "/help — this message\n\n"
@@ -2260,6 +2868,11 @@ def main():
 
     scheduler = BackgroundScheduler(timezone=EST)
 
+    # Playbook briefing: 8am SGT = midnight ET (Mon-Fri)
+    scheduler.add_job(job_playbook_briefing, CronTrigger(
+        hour=0, minute=0, day_of_week="mon-fri"),
+        id="playbook_briefing", name="Trade Playbook Briefing (8am SGT)")
+
     # Pre-market: every 30min 6:30am–11:30am ET
     scheduler.add_job(job_premarket_scan, CronTrigger(
         hour="6-11", minute="0,30", day_of_week="mon-fri"),
@@ -2282,16 +2895,24 @@ def main():
 
     scheduler.start()
 
+    # Auto-populate playbook on startup if no auto entries exist yet
+    if not any(e.get("auto") for e in live_playbook):
+        logger.info("📋 First run — auto-populating playbook...")
+        try:
+            refresh_auto_playbook()
+        except Exception as e:
+            logger.warning(f"Startup playbook refresh failed: {e}")
+
     stock_count = len(get_stock_positions())
     opt_count   = len(get_option_positions())
 
     logger.info("=" * 55)
-    logger.info("✅ Trading Bot v3.1 — Portfolio + Watchlist Options")
+    logger.info("✅ Trading Bot v3.2 — + Trade Playbook")
     logger.info(f"   Portfolio: {stock_count} stocks, {opt_count} options")
-    logger.info(f"   Watchlist: {len(live_watchlist)} tickers (options scan source)")
+    logger.info(f"   Watchlist: {len(live_watchlist)} tickers")
+    logger.info(f"   Playbook: {len(live_playbook)} entries")
     logger.info(f"   Signal confidence gate: {MIN_CONFIDENCE:.0%}")
     logger.info(f"   Alert cooldown: {ALERT_COOLDOWN_MINUTES}min")
-    logger.info(f"   Watchlist cap: {WATCHLIST_MAX_PER_CYCLE}/cycle")
     logger.info(f"   Finnhub news: {'✅ active' if FINNHUB_KEY else '⚠️ key missing'}")
     logger.info("=" * 55)
 
@@ -2313,6 +2934,9 @@ def main():
     app.add_handler(CommandHandler("remind",       cmd_remind))
     app.add_handler(CommandHandler("reminders",    cmd_reminders))
     app.add_handler(CommandHandler("delreminder",  cmd_delreminder))
+
+    # Trade Playbook
+    app.add_handler(CommandHandler("playbook",     cmd_playbook))
 
     # Scans & info
     app.add_handler(CommandHandler("scan",         cmd_scan))
