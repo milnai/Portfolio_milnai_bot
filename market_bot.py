@@ -170,8 +170,26 @@ DEFAULT_PORTFOLIO = {
 }
 
 DEFAULT_WATCHLIST = [
-    "AXON", "SOFI", "BABA", "ZIM", "HIVE", "CRWV", "PLTR", "AMD",
-    "COIN", "MSTR", "ARM", "MRVL", "AVGO",
+    # Large-Cap Tech
+    "AAPL", "GOOG", "TSM", "AMAT", "ARM", "ASML", "AMD", "MU", "LRCX",
+    # Semiconductors & AI Infrastructure
+    "MRVL", "GLW", "INTC",
+    # Cloud & Software
+    "NOW", "PATH", "CRWD", "PANW", "PLTR", "SHOP",
+    # China & Asia Tech
+    "BABA", "FUTU",
+    # Growth & Emerging Tech
+    "BBAI", "HIMS", "SOFI", "AXON",
+    # Space & Defense
+    "LUNR", "RDW", "PL",
+    # Commodities & Materials
+    "BHP", "SCCO", "XOM", "ZIM",
+    # Crypto & Digital Assets
+    "HIVE",
+    # Niche / Speculative
+    "APLD", "NFLX",
+    # ETFs
+    "GLD", "SLV", "VTI",
 ]
 
 EARNINGS_CALENDAR = {
@@ -2090,77 +2108,175 @@ async def cmd_capital(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Usage: `/capital 2000`", parse_mode="Markdown")
 
 
-async def cmd_remind(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/remind TICKER — analyze | /remind TICKER BUY/SELL PRICE [DATE]"""
+async def cmd_analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /analyze TICKER — full technical analysis with score, confidence, signals, and entry/exit suggestion.
+    Separate from /remind which is purely for setting price/date alerts.
+    """
     try:
         if not context.args:
             await update.message.reply_text(
-                "📅 *Remind usage:*\n"
-                "`/remind NVDA` — analyze\n"
-                "`/remind NVDA BUY 190.00` — price alert\n"
-                "`/remind NVDA SELL 220.00 2026-05-15` — price+date",
+                "📊 *Usage:* `/analyze TICKER`\n\nExamples:\n`/analyze RKLB`\n`/analyze NVDA`\n`/analyze SPY`\n\n"
+                "_To set a price alert, use /remind instead._",
                 parse_mode="Markdown"
             )
             return
 
         ticker = context.args[0].upper()
-        if len(context.args) >= 3:
-            action       = context.args[1].upper()
-            target_price = float(context.args[2])
-            remind_date  = context.args[3] if len(context.args) >= 4 else None
-            reminder = {
-                "ticker": ticker, "action": action,
-                "target_price": target_price, "remind_date": remind_date,
-                "note": f"Set {datetime.now(EST).strftime('%Y-%m-%d')}",
-                "added": datetime.now(EST).strftime("%Y-%m-%d"),
-            }
-            reminders.append(reminder)
-            save_reminders(reminders)
-            data    = get_stock_data(ticker)
-            current = data["current_price"] if data else None
-            msg  = f"✅ *Reminder Set!*\n{'🟢' if action=='BUY' else '🔴'} {action} *{ticker}* @ ${target_price:.2f}\n"
-            if current:
-                msg += f"Now: ${current:.2f} ({((current-target_price)/target_price*100):+.1f}% away)\n"
-            if remind_date:
-                msg += f"Date: {remind_date}\n"
-            await update.message.reply_text(msg, parse_mode="Markdown")
-            return
-
         await update.message.reply_text(f"🔍 Analyzing *{ticker}*... (~15 sec)", parse_mode="Markdown")
+
         data = get_stock_data(ticker)
         if not data:
-            await update.message.reply_text(f"❌ No data for {ticker}.")
+            await update.message.reply_text(f"❌ No data for {ticker}. Check the ticker symbol.")
             return
         scored = score_ticker(data)
         if not scored:
             await update.message.reply_text(f"❌ Could not score {ticker}.")
             return
+
         score  = scored["score"]
         price  = data["current_price"]
         conf   = score_to_confidence(score)
         sig    = classify_signal(score)
-        sig_labels = {"STRONG_BUY": "🟢🟢 STRONG BUY", "MEDIUM_BUY": "🟢 BUY",
-                      "STRONG_SELL": "🔴🔴 STRONG SELL", "WEAK_SELL": "🔴 TRIM"}
+        rsi    = scored.get("rsi")
+        bb     = scored.get("bb")
+        ema20  = scored.get("ema20")
+        ema50  = scored.get("ema50")
+
+        sig_labels = {
+            "STRONG_BUY":  "🟢🟢 STRONG BUY",
+            "MEDIUM_BUY":  "🟢 BUY",
+            "STRONG_SELL": "🔴🔴 STRONG SELL",
+            "WEAK_SELL":   "🔴 TRIM / REDUCE",
+        }
         verdict = sig_labels.get(sig, "⏸️ HOLD / NEUTRAL")
-        action  = "BUY" if sig in ("STRONG_BUY","MEDIUM_BUY") else ("SELL" if sig in ("STRONG_SELL","WEAK_SELL") else "WATCH")
-        bb = scored.get("bb")
-        suggestion = f"Entry near ${bb['lower']:.2f} (BB lower)" if bb and action == "BUY" else (
-                     f"Exit near ${bb['upper']:.2f} (BB upper)" if bb and action == "SELL" else "No clear entry")
+        action  = "BUY" if sig in ("STRONG_BUY", "MEDIUM_BUY") else ("SELL" if sig in ("STRONG_SELL", "WEAK_SELL") else "WATCH")
+
+        # Entry/exit suggestion
+        if action == "BUY" and bb:
+            suggestion = f"Entry near ${bb['lower']:.2f} (BB lower) | Stop: ${bb['lower'] * (1 - STOP_LOSS_PCT):.2f}"
+        elif action == "SELL" and bb:
+            suggestion = f"Trim near ${bb['upper']:.2f} (BB upper)"
+        else:
+            suggestion = "No clear entry — wait for stronger signal"
+
+        # Earnings warning
         earn_warn = ""
         earn_date = EARNINGS_CALENDAR.get(ticker)
         if earn_date:
             days = (datetime.strptime(earn_date, "%Y-%m-%d").date() - datetime.now(EST).date()).days
             if 0 <= days <= 14:
-                earn_warn = f"\n⚠️ Earnings in {days} days ({earn_date})"
+                earn_warn = f"\n⚠️ *Earnings in {days} days* ({earn_date}) — size cautiously"
 
-        msg  = f"📊 *{ticker} ANALYSIS*\n\n"
-        msg += f"Price: ${price:.2f} | Score: {score:+d}/6 | Confidence: {conf:.0%}\n"
-        msg += f"Verdict: {verdict}\n"
-        msg += f"💡 {suggestion}{earn_warn}\n\nTop signals:\n"
-        for d in scored["details"][:4]:
+        # News catalyst
+        catalyst = get_news_catalyst(ticker)
+
+        # Confidence bar
+        conf_bar = "▓" * int(conf * 10) + "░" * (10 - int(conf * 10))
+
+        # In portfolio?
+        in_portfolio = any(v["ticker"] == ticker for v in live_portfolio.values())
+        in_watchlist = ticker in live_watchlist
+        context_tag  = "📋 In portfolio" if in_portfolio else ("👁 On watchlist" if in_watchlist else "")
+
+        msg  = f"📊 *{ticker} ANALYSIS*"
+        if context_tag:
+            msg += f" — {context_tag}"
+        msg += f"\n\n"
+        msg += f"Price: *${price:.2f}* | Daily: {data['daily_change_pct']:+.2f}%\n"
+        msg += f"Score: *{score:+d}/6* | Confidence: *{conf:.0%}* [{conf_bar}]\n"
+        msg += f"Verdict: {verdict}\n\n"
+
+        msg += f"📐 *Key levels:*\n"
+        if ema20 and ema50:
+            trend = "↑ Uptrend" if ema20 > ema50 else "↓ Downtrend"
+            msg += f"EMA20: ${ema20:.2f} | EMA50: ${ema50:.2f} — {trend}\n"
+        if bb:
+            msg += f"BB: ${bb['lower']:.2f} — ${bb['upper']:.2f} (mid ${bb['middle']:.2f})\n"
+        if rsi is not None:
+            rsi_note = "oversold" if rsi < 30 else ("overbought" if rsi > 70 else "neutral")
+            msg += f"RSI: {rsi:.1f} ({rsi_note})\n"
+
+        msg += f"\n💡 *Suggestion:* {suggestion}{earn_warn}\n\n"
+
+        msg += f"*All signals:*\n"
+        for d in scored["details"]:
             msg += f"  {d}\n"
-        msg += f"\n━━━━━━━━━━━━━━━━\nSet a reminder:\n`/remind {ticker} {action} {price:.2f}`\n`/remind {ticker} {action} {price:.2f} YYYY-MM-DD`"
+
+        if catalyst:
+            msg += f"\n📰 *Recent news:* {catalyst['impact']}\n"
+            for h in catalyst["headlines"][:2]:
+                msg += f"  • {h[:75]}{'…' if len(h) > 75 else ''}\n"
+
+        msg += f"\n━━━━━━━━━━━━━━━━━━━━\n"
+        msg += f"Set a price alert: `/remind {ticker} {action} {price:.2f}`\n"
+        msg += f"Add to watchlist: `/watchlist add {ticker}`"
+
         await update.message.reply_text(msg, parse_mode="Markdown")
+
+    except Exception as e:
+        logger.error(f"cmd_analyze: {e}")
+        await update.message.reply_text(f"❌ Error: {e}")
+
+
+async def cmd_remind(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /remind TICKER BUY/SELL PRICE [YYYY-MM-DD] — set a price or date-based alert.
+    For stock analysis, use /analyze instead.
+    """
+    try:
+        if not context.args or len(context.args) < 3:
+            await update.message.reply_text(
+                "📅 *Set a price or date alert:*\n\n"
+                "Price alert:\n`/remind NVDA BUY 190.00`\n\n"
+                "Price + date alert:\n`/remind NVDA SELL 220.00 2026-05-15`\n\n"
+                "View alerts: `/reminders`\n"
+                "Delete: `/delreminder 1`\n\n"
+                "_For stock analysis, use /analyze TICKER_",
+                parse_mode="Markdown"
+            )
+            return
+
+        ticker       = context.args[0].upper()
+        action       = context.args[1].upper()
+        target_price = float(context.args[2])
+        remind_date  = context.args[3] if len(context.args) >= 4 else None
+
+        if action not in ("BUY", "SELL", "WATCH"):
+            await update.message.reply_text("❌ Action must be BUY, SELL, or WATCH.")
+            return
+
+        reminder = {
+            "ticker":       ticker,
+            "action":       action,
+            "target_price": target_price,
+            "remind_date":  remind_date,
+            "note":         f"Set {datetime.now(EST).strftime('%Y-%m-%d')}",
+            "added":        datetime.now(EST).strftime("%Y-%m-%d"),
+        }
+        reminders.append(reminder)
+        save_reminders(reminders)
+
+        data    = get_stock_data(ticker)
+        current = data["current_price"] if data else None
+        emoji   = "🟢" if action == "BUY" else "🔴"
+
+        msg  = f"✅ *Reminder Set!*\n\n"
+        msg += f"{emoji} {action} *{ticker}* @ ${target_price:.2f}\n"
+        if current:
+            diff = ((current - target_price) / target_price * 100)
+            msg += f"Current: ${current:.2f} ({diff:+.1f}% away)\n"
+        if remind_date:
+            msg += f"Date: {remind_date}\n"
+        msg += f"\nI'll alert you in the next scan cycle when the price is hit. 🔔\n"
+        msg += f"_Use /reminders to view all | /analyze {ticker} for full analysis_"
+
+        await update.message.reply_text(msg, parse_mode="Markdown")
+
+    except ValueError:
+        await update.message.reply_text(
+            "❌ Invalid price. Example: `/remind NVDA BUY 190.00`", parse_mode="Markdown"
+        )
     except Exception as e:
         logger.error(f"cmd_remind: {e}")
         await update.message.reply_text(f"❌ Error: {e}")
@@ -2206,21 +2322,23 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
         "🤖 *Milnai Trading Bot v3.0*\n\n"
         "*Portfolio Management:*\n"
-        "/add TICKER QTY PRICE [call|put STRIKE EXPIRY] — add position\n"
-        "/delete TICKER [type STRIKE EXPIRY] — remove position\n"
-        "/amend TICKER FIELD VALUE — edit a field\n"
+        "/add TICKER QTY PRICE [call|put STRIKE EXPIRY]\n"
+        "/delete TICKER [type STRIKE EXPIRY]\n"
+        "/amend TICKER FIELD VALUE\n"
         "/portfolio — live P&L (stocks + options)\n\n"
         "*Watchlist:*\n"
         "/watchlist add|remove|view TICKER\n\n"
-        "*Scans & Signals:*\n"
-        "/scan — full scan now\n"
+        "*Analysis:*\n"
+        "/analyze TICKER — full technical analysis\n"
+        "/scan — full portfolio + watchlist scan now\n"
         "/vix — fear index\n\n"
-        "*Reminders:*\n"
-        "/remind TICKER — analyze + set alert\n"
-        "/reminders | /delreminder N\n\n"
+        "*Price Alerts:*\n"
+        "/remind TICKER BUY|SELL PRICE [DATE]\n"
+        "/reminders — view all alerts\n"
+        "/delreminder N — delete alert #N\n\n"
         "*Settings:*\n"
-        "/capital AMOUNT\n"
-        "/help — all commands\n\n"
+        "/capital AMOUNT — set swing trade capital\n"
+        "/help — this message\n\n"
         "📅 Auto alerts fire Mon–Fri during US market hours."
     )
     await update.message.reply_text(msg, parse_mode="Markdown")
@@ -2292,6 +2410,9 @@ def main():
 
     # Watchlist
     app.add_handler(CommandHandler("watchlist",    cmd_watchlist))
+
+    # Analysis
+    app.add_handler(CommandHandler("analyze",      cmd_analyze))
 
     # Reminders
     app.add_handler(CommandHandler("remind",       cmd_remind))
