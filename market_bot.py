@@ -1,32 +1,23 @@
 #!/usr/bin/env python3
 """
-Trading Bot v3.0 — Portfolio + Options + Watchlist + Signal Quality
+Trading Bot v3.1 — Portfolio + Options + Watchlist + Signal Quality
 ====================================================================
 INFRASTRUCTURE: Unchanged (Railway + Telegram + yfinance + APScheduler)
 
-NEW in v3.0 (per requirements doc):
-  - Portfolio Database: stocks AND options (calls/puts) as single source of truth
-  - Commands: /add /delete /amend /portfolio (replaces /buy /sell)
-  - Watchlist System: user-managed, separate from portfolio
-  - Signal Types: Portfolio Protection | Portfolio Growth | Watchlist Opportunity
-  - Alert Format: type / ticker / what / why / strategy / action / confidence
-  - Catalyst Detection: live news via Finnhub + earnings + volume spikes
-  - Pre-Market: every 30min, from 3hr before open to 2hr after open (6:30am–11:30am ET)
-  - Post-Market EOD Summary: total value, daily P&L, gainers/losers + scan every 30min
-  - Signal Quality: deduplication (1hr cooldown), confidence threshold (≥60%), watchlist cap (3/cycle)
+SIGNAL SCAN (one message, 4 blocks):
+  🛡️ Portfolio Protection   — your stocks showing bearish/sell signals
+  🚀 Portfolio Growth        — your stocks showing bullish/add signals
+  🔍 Watchlist Opportunity   — strong stock entries from your watchlist (score ≥5)
+  🎯 Watchlist Options       — call/put setups on your watchlist tickers only
 
-PRESERVED from v2.0:
-  - 6-indicator scoring engine (EMA20/50, RSI, MACD, BB, Volume, ADX)
-  - VIX-based position sizing and sentiment
-  - Swing trade scanner + option hunter
-  - Reminder system (/remind, /reminders, /delreminder)
-  - Telegram chunking, APScheduler, Railway deployment pattern
-  - yfinance as primary data source (no rate limits)
+REMOVED in v3.1:
+  - Option Hunter (broad 64-ticker scan — too many false put signals)
+  - Swing Trade Scanner (removed per user preference)
 
 SCHEDULE (all EST, Mon-Fri only):
-  Pre-market  : Every 30min 6:30am–11:30am | Portfolio+Watchlist signals
-  Market hours: Every 60min 9:30am–3:30pm  | Market report + scans
-  Post-market : EOD summary at 4:15pm | Scan every 30min 4:00–6:00pm
+  Pre-market  : Every 30min 6:30am–11:30am | Signal scan
+  Market hours: Every 60min 9:30am–3:30pm  | Market report + signal scan
+  Post-market : EOD summary at 4:15pm | Signal scan every 30min 4:00–6:00pm
 """
 
 import subprocess
@@ -100,15 +91,6 @@ OPT_MAX_DTE = 35
 OPT_MAX_IV  = 50.0
 OPT_OTM_MIN = 0.01
 OPT_OTM_MAX = 0.10
-
-# --- Swing trade config ---
-SWING_MAX_TRADES  = 2
-SWING_HOLD_DAYS   = 2
-SWING_MIN_PRICE   = 5.0
-SWING_MIN_RR      = 2.0
-SWING_TARGET1_PCT = 0.05
-SWING_TARGET2_PCT = 0.10
-SWING_RISK = {"low": 0.03, "medium": 0.02, "high": 0.01}
 
 # ============================================================================
 # PORTFOLIO DATABASE — Single Source of Truth
@@ -212,21 +194,6 @@ EARNINGS_CALENDAR = {
     "ASTS":  "2026-05-08",
     "GE":    "2026-04-22",
 }
-
-OPTION_HUNT_TICKERS = [
-    "SPY","QQQ","IWM","GLD","SLV",
-    "AAPL","MSFT","NVDA","META","AMZN","GOOGL","TSLA",
-    "AMD","CRWD","PLTR","COIN","MSTR","SNOW","SOFI",
-    "TSM","AMAT","MU","AVGO","QCOM","ARM","MRVL",
-    "JPM","GS","BAC","MS","C",
-    "UNH","JNJ","PFE","MRNA","HIMS",
-    "XOM","CVX","SCCO",
-    "NFLX","DIS","SBUX","NKE",
-    "PYPL","SQ","UBER","ABNB","SHOP",
-    "CRWV","NBIS","APLD",
-    "AXON","PANW","BABA","ZIM","HIVE",
-    "RKLB","ALAB","GRAB","NVDL","IREN","SCHD","ASTS","GE",
-]
 
 
 # ============================================================================
@@ -1122,103 +1089,9 @@ def run_watchlist_signals(vix):
 
 
 # ============================================================================
-# OPTION HUNTER
-# ============================================================================
-
-def get_best_option(ticker, current_price, signal):
-    try:
-        stock = yf.Ticker(ticker)
-        expirations = stock.options
-        if not expirations:
-            return None
-        today = datetime.now().date()
-        best_exp, best_diff = None, 9999
-        for exp in expirations:
-            exp_date = datetime.strptime(exp, "%Y-%m-%d").date()
-            dte = (exp_date - today).days
-            diff = abs(dte - 28)
-            if OPT_MIN_DTE <= dte <= OPT_MAX_DTE and diff < best_diff:
-                best_diff, best_exp = diff, exp
-        if not best_exp:
-            for exp in expirations:
-                exp_date = datetime.strptime(exp, "%Y-%m-%d").date()
-                if (exp_date - today).days >= 14:
-                    best_exp = exp
-                    break
-        if not best_exp:
-            return None
-
-        chain = stock.option_chain(best_exp)
-        dte   = (datetime.strptime(best_exp, "%Y-%m-%d").date() - today).days
-        is_call = signal in ("STRONG_BUY", "MEDIUM_BUY")
-        df          = chain.calls if is_call else chain.puts
-        strike_min  = current_price * (1 + OPT_OTM_MIN) if is_call else current_price * (1 - OPT_OTM_MAX)
-        strike_max  = current_price * (1 + OPT_OTM_MAX) if is_call else current_price * (1 - OPT_OTM_MIN)
-        direction   = "CALL" if is_call else "PUT"
-
-        filtered = df[
-            (df["strike"] >= strike_min) & (df["strike"] <= strike_max) &
-            (df["openInterest"] >= OPT_MIN_OI)
-        ]
-        if filtered.empty:
-            return None
-        filtered = filtered.sort_values("openInterest", ascending=False)
-        best = filtered.iloc[0]
-        iv   = float(best.get("impliedVolatility", 0)) * 100
-        if iv > OPT_MAX_IV:
-            return None
-        bid, ask, last = float(best.get("bid",0) or 0), float(best.get("ask",0) or 0), float(best.get("lastPrice",0) or 0)
-        mid = (bid + ask) / 2 if bid and ask else last
-        return {
-            "direction": direction, "strike": float(best["strike"]),
-            "expiry": best_exp, "dte": dte, "last": last, "mid": mid,
-            "bid": bid, "ask": ask,
-            "oi": int(best.get("openInterest", 0) or 0),
-            "volume": int(best.get("volume", 0) or 0),
-            "iv": round(iv, 1),
-        }
-    except Exception as e:
-        logger.warning(f"Options chain {ticker}: {e}")
-        return None
-
-
-def run_option_hunter(vix):
-    logger.info(f"🎯 Option Hunter scanning {len(OPTION_HUNT_TICKERS)} tickers...")
-    results = []
-    for ticker in OPTION_HUNT_TICKERS:
-        try:
-            data = get_stock_data(ticker)
-            if not data:
-                continue
-            scored = score_ticker(data)
-            if not scored:
-                continue
-            signal = classify_signal(scored["score"])
-            if not signal:
-                continue
-            if vix:
-                if signal in ("STRONG_BUY","MEDIUM_BUY") and vix["level"] > 30:
-                    continue
-                if signal in ("STRONG_SELL","WEAK_SELL") and vix["level"] < 15:
-                    continue
-            option = get_best_option(ticker, data["current_price"], signal)
-            if not option:
-                continue
-            results.append({
-                "ticker": ticker, "price": data["current_price"],
-                "score": scored["score"], "signal": signal,
-                "details": scored["details"], "option": option,
-            })
-            time.sleep(0.5)
-        except Exception as e:
-            logger.error(f"Option Hunter {ticker}: {e}")
-    results.sort(key=lambda x: abs(x["score"]), reverse=True)
-    logger.info(f"🎯 Option Hunter found {len(results)} setup(s)")
-    return results[:10]
-
-
-# ============================================================================
-# SWING TRADE ENGINE (preserved from v2.0)
+# WATCHLIST OPTIONS SCANNER
+# Scans only your watchlist tickers for call setups (bullish signals only).
+# Only fires on STRONG_BUY (score ≥5) to avoid false put recommendations.
 # ============================================================================
 
 def _is_near_earnings(ticker):
@@ -1229,106 +1102,152 @@ def _is_near_earnings(ticker):
     earn_date = datetime.strptime(date_str, "%Y-%m-%d").date()
     return 0 <= (earn_date - today).days <= 2
 
-def _get_top_movers():
-    movers = []
-    candidates = [
-        "NVDA","AMD","TSLA","AAPL","META","AMZN","MSFT","GOOGL",
-        "ARM","MRVL","AVGO","PLTR","CRWD","PANW","SHOP","SOFI",
-        "HIMS","CRWV","NBIS","RKLB","ALAB","IREN","APLD","COIN",
-    ]
-    for ticker in candidates:
+
+def get_best_call(ticker, current_price):
+    """
+    Fetch the best CALL contract for a watchlist ticker.
+    Only CALLs — we don't recommend puts on watchlist tickers since
+    you'd only be watching them if you're bullish on them.
+    Filters: OI >500, DTE 21–35, IV <60%, strike 1–10% OTM.
+    """
+    try:
+        stock = yf.Ticker(ticker)
+        expirations = stock.options
+        if not expirations:
+            return None
+
+        today = datetime.now().date()
+        best_exp, best_diff = None, 9999
+        for exp in expirations:
+            exp_date = datetime.strptime(exp, "%Y-%m-%d").date()
+            dte  = (exp_date - today).days
+            diff = abs(dte - 28)
+            if OPT_MIN_DTE <= dte <= OPT_MAX_DTE and diff < best_diff:
+                best_diff, best_exp = diff, exp
+
+        # Fallback to nearest expiry ≥14 DTE
+        if not best_exp:
+            for exp in expirations:
+                exp_date = datetime.strptime(exp, "%Y-%m-%d").date()
+                if (exp_date - today).days >= 14:
+                    best_exp = exp
+                    break
+        if not best_exp:
+            return None
+
+        chain  = stock.option_chain(best_exp)
+        dte    = (datetime.strptime(best_exp, "%Y-%m-%d").date() - today).days
+        df     = chain.calls
+        strike_min = current_price * (1 + OPT_OTM_MIN)
+        strike_max = current_price * (1 + OPT_OTM_MAX)
+
+        filtered = df[
+            (df["strike"] >= strike_min) &
+            (df["strike"] <= strike_max) &
+            (df["openInterest"] >= OPT_MIN_OI)
+        ]
+        if filtered.empty:
+            return None
+
+        best = filtered.sort_values("openInterest", ascending=False).iloc[0]
+        iv   = float(best.get("impliedVolatility", 0)) * 100
+        if iv > OPT_MAX_IV:
+            return None
+
+        bid  = float(best.get("bid",  0) or 0)
+        ask  = float(best.get("ask",  0) or 0)
+        last = float(best.get("lastPrice", 0) or 0)
+        mid  = (bid + ask) / 2 if bid and ask else last
+        if mid <= 0:
+            return None
+
+        return {
+            "strike":  float(best["strike"]),
+            "expiry":  best_exp,
+            "dte":     dte,
+            "mid":     mid,
+            "bid":     bid,
+            "ask":     ask,
+            "oi":      int(best.get("openInterest", 0) or 0),
+            "volume":  int(best.get("volume", 0) or 0),
+            "iv":      round(iv, 1),
+        }
+    except Exception as e:
+        logger.warning(f"get_best_call {ticker}: {e}")
+        return None
+
+
+def run_watchlist_options(vix):
+    """
+    Scan watchlist for strong bullish signals, then look for a matching CALL.
+    Only fires on score ≥5 (STRONG_BUY) and only recommends CALLs.
+    Skips tickers with earnings within 2 days (IV spike risk).
+    Capped at 3 results per cycle.
+    """
+    logger.info("🎯 Watchlist Options scan running...")
+    results = []
+
+    # Skip if VIX too high (expensive premiums)
+    if vix and vix["level"] > 30:
+        logger.info("🎯 Watchlist Options skipped — VIX > 30, premiums too expensive")
+        return []
+
+    for ticker in live_watchlist:
+        if len(results) >= 3:
+            break
         try:
-            info  = yf.Ticker(ticker).fast_info
-            price = getattr(info, "last_price", None)
-            prev  = getattr(info, "previous_close", None)
-            if price and prev and float(prev) > 0:
-                pct = (float(price) - float(prev)) / float(prev) * 100
-                if abs(pct) >= 3.0:
-                    movers.append(ticker)
-        except:
-            continue
-    return movers
-
-def run_swing_scanner(vix):
-    logger.info("📊 Swing Trade Scanner running...")
-    vix_level    = vix["level"] if vix else 20
-    risk_tier    = "low" if vix_level < 20 else ("medium" if vix_level < 25 else "high")
-    risk_pct     = SWING_RISK[risk_tier]
-    swing_capital = user_settings.get("swing_capital", 2000)
-    risk_dollars = swing_capital * risk_pct
-
-    stock_tickers = get_stock_tickers_from_portfolio()
-    universe = list(set(stock_tickers + OPTION_HUNT_TICKERS + _get_top_movers()))
-    results  = []
-
-    for ticker in universe:
-        try:
-            data = get_stock_data(ticker)
-            if not data or data["current_price"] < SWING_MIN_PRICE:
-                continue
+            # Skip earnings risk
             if _is_near_earnings(ticker):
+                logger.info(f"   {ticker} skipped — earnings within 2 days")
+                continue
+
+            data = get_stock_data(ticker)
+            if not data:
                 continue
 
             scored = score_ticker(data)
-            if not scored or scored["score"] < BUY_MEDIUM:
+            if not scored:
                 continue
 
-            rsi = scored.get("rsi")
-            if rsi and (rsi > 68 or rsi < 35):
+            # Only STRONG_BUY (≥5) for options — medium signals not reliable enough
+            if scored["score"] < BUY_STRONG:
                 continue
 
-            vols = data["volumes"]
-            if len(vols) < 20:
-                continue
-            avg_vol   = np.mean(vols[-20:])
-            vol_ratio = vols[-1] / avg_vol if avg_vol > 0 else 1
-            if vol_ratio < 1.3:
+            should, conf = _should_alert(f"{ticker}_option", "WATCHLIST_OPTION", scored["score"])
+            if not should:
                 continue
 
-            atr = _atr(data["highs"], data["lows"], data["closes"])
-            if not atr:
+            price  = data["current_price"]
+            option = get_best_call(ticker, price)
+            if not option:
                 continue
 
-            entry          = data["current_price"]
-            stop           = round(entry - (1.5 * atr), 2)
-            risk_per_share = entry - stop
-            if risk_per_share <= 0:
-                continue
-
-            shares      = max(1, int(risk_dollars / risk_per_share))
-            max_shares  = int((swing_capital * 0.75) / entry)
-            shares      = min(shares, max_shares)
-            pos_value   = round(shares * entry, 2)
-            dollar_risk = round(shares * risk_per_share, 2)
-
-            t1_price  = round(entry * (1 + SWING_TARGET1_PCT), 2)
-            t2_price  = round(entry * (1 + SWING_TARGET2_PCT), 2)
-            t1_profit = round(shares * 0.5 * (t1_price - entry), 2)
-            t2_profit = round(shares * 0.5 * (t2_price - entry), 2)
-            total_profit = round(t1_profit + t2_profit, 2)
-            rr = round(total_profit / dollar_risk, 2) if dollar_risk > 0 else 0
-            if rr < SWING_MIN_RR:
-                continue
+            catalyst  = get_news_catalyst(ticker)
+            earn_warn = None
+            earn_date = EARNINGS_CALENDAR.get(ticker)
+            if earn_date:
+                days = (datetime.strptime(earn_date, "%Y-%m-%d").date() - datetime.now(EST).date()).days
+                if 3 <= days <= 14:
+                    earn_warn = f"⚠️ Earnings in {days} days — IV may spike, size small"
 
             results.append({
-                "ticker": ticker, "score": scored["score"],
-                "entry": entry, "stop": stop,
-                "t1_price": t1_price, "t2_price": t2_price,
-                "t1_profit": t1_profit, "t2_profit": t2_profit,
-                "total_profit": total_profit, "shares": shares,
-                "position_value": pos_value, "dollar_risk": dollar_risk,
-                "rr": rr, "rsi": round(rsi, 1) if rsi else "N/A",
-                "vol_ratio": round(vol_ratio, 1), "atr": round(atr, 2),
-                "cancel_below": round(entry * 0.99, 2),
-                "risk_tier": risk_tier, "details": scored["details"],
+                "ticker":     ticker,
+                "price":      price,
+                "score":      scored["score"],
+                "confidence": conf,
+                "details":    scored["details"],
+                "option":     option,
+                "catalyst":   catalyst,
+                "earn_warning": earn_warn,
             })
-            time.sleep(0.3)
-        except Exception as e:
-            logger.warning(f"Swing scan {ticker}: {e}")
+            _record_alert(f"{ticker}_option")
+            time.sleep(0.5)
 
-    results.sort(key=lambda x: (x["score"], x["rr"]), reverse=True)
-    logger.info(f"📊 Swing scanner found {len(results)} setup(s)")
-    return results[:3]
+        except Exception as e:
+            logger.error(f"Watchlist Options {ticker}: {e}")
+
+    logger.info(f"🎯 Watchlist Options found {len(results)} setup(s)")
+    return results
 
 
 # ============================================================================
@@ -1442,8 +1361,62 @@ def format_eod_summary(pnl_data, market, vix):
         return "❌ EOD summary error"
 
 
-def format_portfolio_signals(protection, growth, watchlist, vix):
-    """Format all 3 signal types into a combined Telegram message."""
+def format_watchlist_options(options_setups, vix):
+    """Format the 🎯 Watchlist Options block — called inside format_portfolio_signals."""
+    if not options_setups:
+        if vix and vix["level"] > 30:
+            return "🎯 *WATCHLIST OPTIONS:* Skipped — VIX > 30, premiums too expensive\n\n"
+        return "🎯 *WATCHLIST OPTIONS:* No strong call setups on watchlist (score ≥5 required)\n\n"
+
+    msg = f"🎯 *WATCHLIST OPTIONS ({len(options_setups)} setup(s))*\n\n"
+    if vix:
+        iv_note = "✅ Low IV — cheap premiums" if vix["call_friendly"] else "⚠️ Elevated IV — size smaller"
+        msg += f"{vix['emoji']} VIX: {vix['level']:.2f} — {iv_note}\n\n"
+
+    for s in options_setups:
+        opt  = s["option"]
+        conf = s["confidence"]
+        conf_bar = "▓" * int(conf * 10) + "░" * (10 - int(conf * 10))
+        max_risk   = round(opt["mid"] * 100, 2)
+        target_pnl = round(opt["mid"] * 2 * 100, 2)
+
+        msg += f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        msg += f"🟢🟢 WATCHLIST CALL: *{s['ticker']}* @ ${s['price']:.2f}\n"
+        msg += f"Score: {s['score']:+d}/6 | Confidence: {conf:.0%} [{conf_bar}]\n\n"
+        msg += f"📌 *Why:* {s['score']}/6 indicators bullish — strong technical alignment\n"
+        msg += f"✅ *Action:* Only enter if stock stays ≤ ${s['price'] * 1.005:.2f} (within 0.5%)\n\n"
+        msg += f"*Contract:* ${opt['strike']:.0f} CALL | Exp: {opt['expiry']} ({opt['dte']} DTE)\n"
+        msg += f"*Premium:* ~${opt['mid']:.2f}/share (~${max_risk:.0f}/contract)\n"
+        msg += f"*Target:* ${opt['mid'] * 2:.2f} (2×) = +${target_pnl:.0f} | OI: {opt['oi']:,} | IV: {opt['iv']:.0f}%\n"
+        msg += f"*Stop:* Exit if premium drops 50% (−${max_risk * 0.5:.0f})\n\n"
+
+        msg += "*Top signals:*\n"
+        for d in s["details"][:4]:
+            msg += f"  {d}\n"
+
+        if s.get("catalyst"):
+            cat = s["catalyst"]
+            msg += f"\n📰 *News:* {cat['impact']}\n"
+            for h in cat["headlines"][:1]:
+                msg += f"  • {h[:75]}{'…' if len(h) > 75 else ''}\n"
+
+        if s.get("earn_warning"):
+            msg += f"\n{s['earn_warning']}\n"
+
+        msg += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+
+    msg += "⚠️ _1 contract = 100 shares. Max 2% capital. Options can expire worthless._\n\n"
+    return msg
+
+
+def format_portfolio_signals(protection, growth, watchlist_stocks, watchlist_options, vix):
+    """
+    Unified signal scan — 4 blocks:
+      🛡️ Portfolio Protection   (your stocks, bearish signals)
+      🚀 Portfolio Growth        (your stocks, bullish add signals)
+      🔍 Watchlist Opportunity   (watchlist stocks, score ≥5)
+      🎯 Watchlist Options       (watchlist CALLs only, score ≥5)
+    """
     try:
         t   = _time_display()
         msg = f"📡 *SIGNAL SCAN*\n_{t['sgt']} | {t['est']}_\n\n"
@@ -1451,6 +1424,7 @@ def format_portfolio_signals(protection, growth, watchlist, vix):
         if vix:
             msg += f"{vix['emoji']} VIX: {vix['level']:.2f} — {vix['sentiment']}\n\n"
 
+        # ── Block 1: Portfolio Protection ─────────────────────────────
         if protection:
             msg += f"🛡️ *PORTFOLIO PROTECTION ({len(protection)} alert(s))*\n\n"
             for s in protection:
@@ -1460,8 +1434,9 @@ def format_portfolio_signals(protection, growth, watchlist, vix):
                     s["details"], earn_warning=s.get("earn_warning"),
                 ) + "\n\n"
         else:
-            msg += "🛡️ *PORTFOLIO PROTECTION:* No alerts this cycle\n\n"
+            msg += "🛡️ *PORTFOLIO PROTECTION:* All positions healthy — no trim signals\n\n"
 
+        # ── Block 2: Portfolio Growth ──────────────────────────────────
         if growth:
             msg += f"🚀 *PORTFOLIO GROWTH ({len(growth)} signal(s))*\n\n"
             for s in growth:
@@ -1473,18 +1448,23 @@ def format_portfolio_signals(protection, growth, watchlist, vix):
         else:
             msg += "🚀 *PORTFOLIO GROWTH:* No add signals this cycle\n\n"
 
-        if watchlist:
-            msg += f"🔍 *WATCHLIST OPPORTUNITIES ({len(watchlist)} found)*\n\n"
-            for s in watchlist:
+        # ── Block 3: Watchlist Stock Opportunities ─────────────────────
+        if watchlist_stocks:
+            msg += f"🔍 *WATCHLIST OPPORTUNITIES ({len(watchlist_stocks)} found)*\n\n"
+            for s in watchlist_stocks:
                 msg += _format_signal_alert(
                     s["signal_type"], s["ticker"], s["price"], s["score"],
                     s["confidence"], s["what"], s["why"], s["strategy"], s["action"],
-                    s["details"], catalyst=s.get("catalyst"), earn_warning=s.get("earn_warning"),
+                    s["details"], catalyst=s.get("catalyst"),
+                    earn_warning=s.get("earn_warning"),
                 ) + "\n\n"
         else:
-            msg += "🔍 *WATCHLIST:* No high-confidence opportunities (score ≥5 required)\n\n"
+            msg += "🔍 *WATCHLIST STOCKS:* No high-confidence entries (score ≥5 required)\n\n"
 
-        msg += "_Confidence ≥60% required | Same ticker cooldown: 60min | Watchlist cap: 3/cycle_"
+        # ── Block 4: Watchlist Options ─────────────────────────────────
+        msg += format_watchlist_options(watchlist_options, vix)
+
+        msg += "_Confidence ≥60% | Cooldown: 60min/ticker | Max 3 watchlist alerts/cycle_"
         return msg
     except Exception as e:
         logger.error(f"format_portfolio_signals: {e}")
@@ -1505,73 +1485,6 @@ def format_earnings_alerts(alerts):
         msg += f"⚠️ IV spikes at open — buy options BEFORE report\n\n"
     msg += "_Earnings = binary risk. Max 1% capital per trade._"
     return msg
-
-
-def format_option_hunter(opportunities, vix):
-    try:
-        t   = _time_display()
-        msg = "🎯 *OPTION HUNTER*\n"
-        msg += f"_{t['sgt']} | {t['est']}_\n\n"
-        if vix:
-            iv_note = "✅ Low IV — cheap premiums" if vix["call_friendly"] else "⚠️ Elevated IV — expensive premiums"
-            msg += f"{vix['emoji']} *VIX: {vix['level']:.2f}* — {iv_note}\n\n"
-        if not opportunities:
-            msg += "🔍 *No qualifying setups this scan.*\n_Criteria: Score ≥4/6 | OI >500 | DTE 21–35 | IV <50%_\n"
-            return msg
-
-        labels = {
-            "STRONG_BUY": "🟢🟢 STRONG CALL", "MEDIUM_BUY": "🟢 MEDIUM CALL",
-            "STRONG_SELL": "🔴🔴 STRONG PUT", "WEAK_SELL": "🔴 MEDIUM PUT",
-        }
-        for opp in opportunities:
-            opt = opp["option"]
-            label = labels.get(opp["signal"], opt["direction"])
-            max_risk = round(opt["mid"] * 100, 2)
-            msg += f"{label}: *{opp['ticker']}*\n"
-            msg += f"Stock: ${opp['price']:.2f} | Score: {opp['score']:+d}/6\n"
-            msg += f"Contract: ${opt['strike']:.0f} {opt['direction']} | Exp: {opt['expiry']} ({opt['dte']} DTE)\n"
-            msg += f"Premium: ~${opt['mid']:.2f} | Max risk: ${max_risk:.0f} | OI: {opt['oi']:,} | IV: {opt['iv']:.0f}%\n"
-            msg += f"Target: ${opt['mid']*2:.2f} (2×) | Entry trigger: ≤${opp['price']*1.005:.2f}\n"
-            for d in opp["details"][:3]:
-                msg += f"  {d}\n"
-            msg += "\n"
-        msg += "⚠️ _1 contract = 100 shares. Never risk >2% capital per trade._"
-        return msg
-    except Exception as e:
-        return f"❌ Option Hunter error: {e}"
-
-
-def format_swing_trades(setups, vix):
-    try:
-        t   = _time_display()
-        msg = "📊 *SWING TRADE SETUPS*\n"
-        msg += f"_{t['sgt']} | {t['est']}_\n\n"
-        vix_level    = vix["level"] if vix else 20
-        swing_capital = user_settings.get("swing_capital", 2000)
-        if vix:
-            msg += f"{vix['emoji']} *VIX: {vix_level:.1f}* — {vix['sentiment']}\n"
-        risk_pct     = SWING_RISK["low"] if vix_level < 20 else (SWING_RISK["medium"] if vix_level < 25 else SWING_RISK["high"])
-        risk_dollars = swing_capital * risk_pct
-        msg += f"💰 Capital: ${swing_capital:,} | Risk/trade: ${risk_dollars:.0f} ({risk_pct*100:.0f}% VIX-calibrated)\n\n"
-        if not setups:
-            msg += "🔍 *No qualifying swing setups this scan.*\n"
-            return msg
-        for s in setups:
-            label = "🟢🟢 STRONG SWING" if s["score"] >= BUY_STRONG else "🟢 MEDIUM SWING"
-            msg += f"{'━'*32}\n{label}: *{s['ticker']}*\n"
-            msg += f"Score: {s['score']:+d}/6 | RSI: {s['rsi']} | Vol: {s['vol_ratio']}×\n\n"
-            msg += f"*Entry:* ${s['entry']:.2f} | *Stop:* ${s['stop']:.2f} | *Shares:* {s['shares']}\n"
-            msg += f"*T1:* ${s['t1_price']:.2f} (+5%) → +${s['t1_profit']:.0f}\n"
-            msg += f"*T2:* ${s['t2_price']:.2f} (+10%) → +${s['t2_profit']:.0f}\n"
-            msg += f"*R/R:* 1:{s['rr']} | Hold max {SWING_HOLD_DAYS}d\n"
-            msg += f"❌ Cancel below ${s['cancel_below']:.2f}\n"
-            for d in s["details"][:3]:
-                msg += f"  {d}\n"
-            msg += "\n"
-        msg += f"⚠️ _Max {SWING_MAX_TRADES} trades at once. Stop loss mandatory._"
-        return msg
-    except Exception as e:
-        return f"❌ Swing trade error: {e}"
 
 
 def format_reminders_section():
@@ -1660,31 +1573,30 @@ def send_telegram(message):
 # SCHEDULED JOB HANDLERS
 # ============================================================================
 
+def _run_all_signals(vix, stock_cache=None):
+    """Helper: runs all 4 signal types and returns them together."""
+    if stock_cache is None:
+        pnl_data    = get_portfolio_pnl()
+        stock_cache = pnl_data.get("stock_cache", {})
+    protection, growth = run_portfolio_signals(vix, stock_cache)
+    wl_stocks          = run_watchlist_signals(vix)
+    wl_options         = run_watchlist_options(vix)
+    return protection, growth, wl_stocks, wl_options
+
+
 def job_premarket_scan():
-    """
-    Pre-market scan: every 30min from 6:30am to 11:30am ET.
-    Runs Portfolio Protection + Growth + Watchlist signals.
-    Also checks earnings alerts at 7am.
-    """
+    """Pre-market scan: every 30min 6:30am–11:30am ET."""
     logger.info("⏰ Pre-market scan running...")
     try:
         vix      = get_vix()
         pnl_data = get_portfolio_pnl()
         sc       = pnl_data.get("stock_cache", {})
-
-        # Portfolio signals
-        protection, growth = run_portfolio_signals(vix, sc)
-        watchlist          = run_watchlist_signals(vix)
-
-        if protection or growth or watchlist:
-            msg = format_portfolio_signals(protection, growth, watchlist, vix)
-            send_telegram(msg)
+        protection, growth, wl_stocks, wl_options = _run_all_signals(vix, sc)
+        if protection or growth or wl_stocks or wl_options:
+            send_telegram(format_portfolio_signals(protection, growth, wl_stocks, wl_options, vix))
         else:
-            logger.info("✅ Pre-market scan: no actionable signals")
-
-        # Earnings check
-        hour = datetime.now(EST).hour
-        if hour == 7:
+            logger.info("✅ Pre-market: no actionable signals this cycle")
+        if datetime.now(EST).hour == 7:
             alerts = check_earnings_alerts()
             msg    = format_earnings_alerts(alerts)
             if msg:
@@ -1694,27 +1606,24 @@ def job_premarket_scan():
 
 
 def job_market_report():
-    """Regular market hours report — every 60min 9:30am–3:30pm ET."""
+    """Market hours: report + signals every 60min 9:30am–3:30pm ET."""
     logger.info("📊 Market report running...")
     try:
         vix      = get_vix()
         pnl_data = get_portfolio_pnl()
         market   = get_market_metrics()
         send_telegram(format_market_report(pnl_data, market, vix))
-
-        # Also run signals during market hours
         sc = pnl_data.get("stock_cache", {})
-        protection, growth = run_portfolio_signals(vix, sc)
-        watchlist          = run_watchlist_signals(vix)
-        if protection or growth or watchlist:
+        protection, growth, wl_stocks, wl_options = _run_all_signals(vix, sc)
+        if protection or growth or wl_stocks or wl_options:
             time.sleep(2)
-            send_telegram(format_portfolio_signals(protection, growth, watchlist, vix))
+            send_telegram(format_portfolio_signals(protection, growth, wl_stocks, wl_options, vix))
     except Exception as e:
         logger.error(f"job_market_report: {e}")
 
 
 def job_eod_summary():
-    """EOD summary at 4:15pm ET — portfolio value, daily P&L, gainers/losers."""
+    """EOD summary at 4:15pm ET."""
     logger.info("🔔 EOD summary running...")
     try:
         vix      = get_vix()
@@ -1726,31 +1635,16 @@ def job_eod_summary():
 
 
 def job_postmarket_scan():
-    """Post-market scan: every 30min 4:00pm–6:00pm ET. Option Hunter + Swing + Signals."""
+    """Post-market scan: signal scan + reminders every 30min 4:00pm–6:00pm ET."""
     logger.info("📡 Post-market scan running...")
     try:
         vix = get_vix()
-
         reminder_msg = format_reminders_section()
         if reminder_msg:
             send_telegram(reminder_msg)
             time.sleep(2)
-
-        opps = run_option_hunter(vix)
-        send_telegram(format_option_hunter(opps, vix))
-        time.sleep(3)
-
-        setups = run_swing_scanner(vix)
-        send_telegram(format_swing_trades(setups, vix))
-
-        # Post-market portfolio signals
-        pnl_data = get_portfolio_pnl()
-        sc = pnl_data.get("stock_cache", {})
-        protection, growth = run_portfolio_signals(vix, sc)
-        watchlist          = run_watchlist_signals(vix)
-        if protection or growth or watchlist:
-            time.sleep(2)
-            send_telegram(format_portfolio_signals(protection, growth, watchlist, vix))
+        protection, growth, wl_stocks, wl_options = _run_all_signals(vix)
+        send_telegram(format_portfolio_signals(protection, growth, wl_stocks, wl_options, vix))
     except Exception as e:
         logger.error(f"job_postmarket_scan: {e}")
 
@@ -2060,20 +1954,17 @@ async def cmd_watchlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ── Info & Scan Commands ──────────────────────────────────────────────────────
 
 async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/scan — full manual scan: signals + option hunter + swing trades"""
-    await update.message.reply_text("🔍 Running full scan... ~2 minutes")
+    """/scan — full manual signal scan: portfolio + watchlist stocks + watchlist options"""
+    await update.message.reply_text("🔍 Running full scan... ~90 seconds")
     try:
-        vix        = get_vix()
-        pnl_data   = get_portfolio_pnl()
-        sc         = pnl_data.get("stock_cache", {})
-        protection, growth = run_portfolio_signals(vix, sc)
-        watchlist  = run_watchlist_signals(vix)
-        opps       = run_option_hunter(vix)
-        setups     = run_swing_scanner(vix)
-
-        await update.message.reply_text(format_portfolio_signals(protection, growth, watchlist, vix), parse_mode="Markdown")
-        await update.message.reply_text(format_option_hunter(opps, vix), parse_mode="Markdown")
-        await update.message.reply_text(format_swing_trades(setups, vix), parse_mode="Markdown")
+        vix      = get_vix()
+        pnl_data = get_portfolio_pnl()
+        sc       = pnl_data.get("stock_cache", {})
+        protection, growth, wl_stocks, wl_options = _run_all_signals(vix, sc)
+        await update.message.reply_text(
+            format_portfolio_signals(protection, growth, wl_stocks, wl_options, vix),
+            parse_mode="Markdown"
+        )
     except Exception as e:
         logger.error(f"cmd_scan: {e}")
         await update.message.reply_text(f"❌ Error: {e}")
@@ -2090,20 +1981,26 @@ async def cmd_vix(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_capital(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/capital AMOUNT — update swing trade capital"""
+    """/capital AMOUNT — set capital budget for position sizing guidance"""
     global user_settings
     try:
         if not context.args:
             cap = user_settings.get("swing_capital", 2000)
-            await update.message.reply_text(f"💰 Swing capital: *${cap:,}*\nChange: `/capital 3000`", parse_mode="Markdown")
+            await update.message.reply_text(
+                f"💰 Capital budget: *${cap:,}*\nChange: `/capital 3000`",
+                parse_mode="Markdown"
+            )
             return
         capital = float(context.args[0])
         if capital <= 0:
-            await update.message.reply_text("❌ Must be positive.")
+            await update.message.reply_text("❌ Must be a positive number.")
             return
         user_settings["swing_capital"] = capital
         save_settings(user_settings)
-        await update.message.reply_text(f"✅ Swing capital → *${capital:,.0f}*", parse_mode="Markdown")
+        await update.message.reply_text(
+            f"✅ Capital budget updated to *${capital:,.0f}*",
+            parse_mode="Markdown"
+        )
     except ValueError:
         await update.message.reply_text("❌ Usage: `/capital 2000`", parse_mode="Markdown")
 
@@ -2337,7 +2234,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/reminders — view all alerts\n"
         "/delreminder N — delete alert #N\n\n"
         "*Settings:*\n"
-        "/capital AMOUNT — set swing trade capital\n"
+        "/capital AMOUNT — set capital budget\n"
         "/help — this message\n\n"
         "📅 Auto alerts fire Mon–Fri during US market hours."
     )
@@ -2389,11 +2286,9 @@ def main():
     opt_count   = len(get_option_positions())
 
     logger.info("=" * 55)
-    logger.info("✅ Trading Bot v3.0 — Portfolio + Options + Watchlist")
+    logger.info("✅ Trading Bot v3.1 — Portfolio + Watchlist Options")
     logger.info(f"   Portfolio: {stock_count} stocks, {opt_count} options")
-    logger.info(f"   Watchlist: {len(live_watchlist)} tickers")
-    logger.info(f"   Option Hunt universe: {len(OPTION_HUNT_TICKERS)} tickers")
-    logger.info(f"   Swing capital: ${user_settings.get('swing_capital',2000):,}")
+    logger.info(f"   Watchlist: {len(live_watchlist)} tickers (options scan source)")
     logger.info(f"   Signal confidence gate: {MIN_CONFIDENCE:.0%}")
     logger.info(f"   Alert cooldown: {ALERT_COOLDOWN_MINUTES}min")
     logger.info(f"   Watchlist cap: {WATCHLIST_MAX_PER_CYCLE}/cycle")
