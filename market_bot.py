@@ -1,39 +1,40 @@
 #!/usr/bin/env python3
 """
-Trading Bot v2.0 + Option Hunter
-=================================
-FIXED from v1:
-  - Polygon.io replaces Finnhub (proper candle API, no rate limits)
-  - Full 6-indicator system: EMA20/50, RSI, MACD, BB, Volume, ADX
-  - Signal threshold: 4+/6 for BUY (was incorrectly 2+)
-  - Holdings updated: INTC removed, IREN added
-  - Stop loss corrected to 3.5% (per strategy doc)
+Trading Bot v3.0 — Portfolio + Options + Watchlist + Signal Quality
+====================================================================
+INFRASTRUCTURE: Unchanged (Railway + Telegram + yfinance + APScheduler)
 
-NEW in v2:
-  - Option Hunter: scans 55 liquid tickers for CALL/PUT setups
-  - Dual-source price validator (Polygon vs yfinance, blocks if >0.5% diff)
-  - VIX via yfinance single call (no API cost)
-  - Options chain via yfinance: OI filter, IV filter, 21-35 DTE targeting
-  - Telegram chunking (handles Telegram 4096 char limit)
+NEW in v3.0 (per requirements doc):
+  - Portfolio Database: stocks AND options (calls/puts) as single source of truth
+  - Commands: /add /delete /amend /portfolio (replaces /buy /sell)
+  - Watchlist System: user-managed, separate from portfolio
+  - Signal Types: Portfolio Protection | Portfolio Growth | Watchlist Opportunity
+  - Alert Format: type / ticker / what / why / strategy / action / confidence
+  - Catalyst Detection: live news via Finnhub + earnings + volume spikes
+  - Pre-Market: every 30min, from 3hr before open to 2hr after open (6:30am–11:30am ET)
+  - Post-Market EOD Summary: total value, daily P&L, gainers/losers + scan every 30min
+  - Signal Quality: deduplication (1hr cooldown), confidence threshold (≥60%), watchlist cap (3/cycle)
+
+PRESERVED from v2.0:
+  - 6-indicator scoring engine (EMA20/50, RSI, MACD, BB, Volume, ADX)
+  - VIX-based position sizing and sentiment
+  - Swing trade scanner + option hunter
+  - Reminder system (/remind, /reminders, /delreminder)
+  - Telegram chunking, APScheduler, Railway deployment pattern
+  - yfinance as primary data source (no rate limits)
 
 SCHEDULE (all EST, Mon-Fri only):
-  Pre-market  : Market report hourly 6:30-9:30am | Option Hunter at 8:30am
-  Market hours: Market report hourly 9:30am-3:30pm | Option Hunter at 10am, 12pm, 2pm
-  Post-market : Trading signals at 4:00pm & 4:30pm | Option Hunter at 4:15pm
+  Pre-market  : Every 30min 6:30am–11:30am | Portfolio+Watchlist signals
+  Market hours: Every 60min 9:30am–3:30pm  | Market report + scans
+  Post-market : EOD summary at 4:15pm | Scan every 30min 4:00–6:00pm
 """
 
 import subprocess
 import sys
 
-# Auto-install missing packages (Railway/Docker safety net)
 _REQUIRED = [
-    "yfinance",
-    "requests",
-    "numpy",
-    "APScheduler",
-    "python-telegram-bot",
-    "python-dotenv",
-    "pytz",
+    "yfinance", "requests", "numpy", "APScheduler",
+    "python-telegram-bot", "python-dotenv", "pytz",
 ]
 
 def _ensure_packages():
@@ -41,7 +42,6 @@ def _ensure_packages():
         try:
             __import__(pkg.lower().replace("-", "_"))
         except ImportError:
-            print(f"[setup] Installing missing package: {pkg}")
             subprocess.check_call([sys.executable, "-m", "pip", "install", pkg, "--quiet"])
 
 _ensure_packages()
@@ -56,16 +56,15 @@ import numpy as np
 import yfinance as yf
 import requests
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from telegram import Bot, Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# Logging must be set up first — before any function calls at module level
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
@@ -75,351 +74,253 @@ logger = logging.getLogger(__name__)
 
 TELEGRAM_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT   = int(os.getenv("TELEGRAM_CHAT_ID", "0"))
+FINNHUB_KEY     = os.getenv("FINNHUB_API_KEY", "")
 
 EST = pytz.timezone("US/Eastern")
 SGT = pytz.timezone("Asia/Singapore")
 
-# --- Holdings (updated Apr 18 2026: RKLB 67 shares, APLD added) ---
-HOLDINGS = {
-    "RKLB": {"shares": 67,  "avg_cost": 68.439},
-    "NVDA": {"shares": 10,  "avg_cost": 175.90},
-    "MSFT": {"shares": 2,   "avg_cost": 372.50},
-    "ALAB": {"shares": 3,   "avg_cost": 116.00},
-    "SCHD": {"shares": 15,  "avg_cost": 30.50},
-    "NBIS": {"shares": 5,   "avg_cost": 114.90},
-    "NVDL": {"shares": 10,  "avg_cost": 80.90},
-    "SLV":  {"shares": 18,  "avg_cost": 90.667},
-    "GRAB": {"shares": 284, "avg_cost": 5.899},
-    "IREN": {"shares": 5,   "avg_cost": 47.00},
-    "APLD": {"shares": 10,  "avg_cost": 31.40},
-}
-
-MARKET_TICKERS = ["SPY", "QQQ"]
-
-# ============================================================================
-# PORTFOLIO PERSISTENCE
-# ============================================================================
-# Holdings are saved to portfolio.json so updates via Telegram survive restarts.
-# On first run, loads from hardcoded HOLDINGS above as the default.
-
-PORTFOLIO_FILE = "portfolio.json"
-
-def load_portfolio():
-    """Load portfolio from JSON file. Falls back to hardcoded HOLDINGS if missing."""
-    try:
-        if os.path.exists(PORTFOLIO_FILE):
-            with open(PORTFOLIO_FILE, "r") as f:
-                data = json.load(f)
-                logger.info(f"✅ Portfolio loaded from {PORTFOLIO_FILE} ({len(data)} positions)")
-                return data
-    except Exception as e:
-        logger.warning(f"Could not load portfolio.json: {e}")
-    logger.info("📋 Using hardcoded HOLDINGS as default portfolio")
-    return {k: dict(v) for k, v in HOLDINGS.items()}
-
-
-def save_portfolio(portfolio):
-    """Save current portfolio to JSON file."""
-    try:
-        with open(PORTFOLIO_FILE, "w") as f:
-            json.dump(portfolio, f, indent=2)
-        logger.info(f"💾 Portfolio saved ({len(portfolio)} positions)")
-    except Exception as e:
-        logger.error(f"Could not save portfolio: {e}")
-
-
-# Live portfolio — loaded on startup, updated via Telegram commands
-live_portfolio = load_portfolio()
-
-# ============================================================================
-# USER SETTINGS
-# ============================================================================
-
-SETTINGS_FILE = "settings.json"
-
-def load_settings():
-    try:
-        if os.path.exists(SETTINGS_FILE):
-            with open(SETTINGS_FILE, "r") as f:
-                return json.load(f)
-    except:
-        pass
-    return {"swing_capital": 2000, "name": ""}
-
-def save_settings(s):
-    try:
-        with open(SETTINGS_FILE, "w") as f:
-            json.dump(s, f, indent=2)
-    except Exception as e:
-        logger.error(f"Could not save settings: {e}")
-
-user_settings = load_settings()
-
-REMINDERS_FILE = "reminders.json"
-
-def load_reminders():
-    try:
-        if os.path.exists(REMINDERS_FILE):
-            with open(REMINDERS_FILE, "r") as f:
-                return json.load(f)
-    except:
-        pass
-    return []
-
-def save_reminders(reminders_list):
-    try:
-        with open(REMINDERS_FILE, "w") as f:
-            json.dump(reminders_list, f, indent=2)
-    except Exception as e:
-        logger.error(f"Could not save reminders: {e}")
-
-# Live reminders — loaded on startup
-reminders = load_reminders()
-
-
-def analyze_for_reminder(ticker):
-    """
-    Full analysis of a ticker for the /remind command.
-    Returns verdict, score, key reasons, suggested action price.
-    """
-    try:
-        data = get_stock_data(ticker)
-        if not data:
-            return None
-        scored = score_ticker(data)
-        if not scored:
-            return None
-
-        score   = scored["score"]
-        price   = data["current_price"]
-        bb      = scored.get("bb")
-        rsi     = scored.get("rsi")
-
-        if score >= 5:
-            verdict    = "🟢🟢 STRONG BUY"
-            action     = "BUY"
-            suggestion = f"Entry near ${bb['lower']:.2f} (BB lower)" if bb else f"Entry ~${price*0.98:.2f}"
-        elif score >= 4:
-            verdict    = "🟢 MEDIUM BUY"
-            action     = "BUY"
-            suggestion = f"Entry at current ${price:.2f}"
-        elif score <= -4:
-            verdict    = "🔴🔴 STRONG SELL"
-            action     = "SELL"
-            suggestion = f"Exit near ${bb['upper']:.2f} (BB upper)" if bb else f"Exit ~${price*1.02:.2f}"
-        elif score <= -2:
-            verdict    = "🔴 TRIM POSITION"
-            action     = "SELL"
-            suggestion = "Trim 30-50% to lock gains"
-        else:
-            verdict    = "⏸️ HOLD / NEUTRAL"
-            action     = "WAIT"
-            suggestion = "No clear signal — wait for stronger setup"
-
-        earn_warning = ""
-        earn_date = EARNINGS_CALENDAR.get(ticker)
-        if earn_date:
-            today     = datetime.now(EST).date()
-            earn_dt   = datetime.strptime(earn_date, "%Y-%m-%d").date()
-            days_away = (earn_dt - today).days
-            if 0 <= days_away <= 14:
-                earn_warning = f"⚠️ Earnings in {days_away} days ({earn_date})"
-
-        return {
-            "ticker":       ticker,
-            "price":        price,
-            "score":        score,
-            "verdict":      verdict,
-            "action":       action,
-            "suggestion":   suggestion,
-            "details":      scored["details"],
-            "rsi":          round(rsi, 1) if rsi else None,
-            "earn_warning": earn_warning,
-        }
-    except Exception as e:
-        logger.error(f"analyze_for_reminder {ticker}: {e}")
-        return None
-
-
-def format_reminders_section():
-    """
-    Formats the reminders section shown ABOVE Option Hunter.
-    Checks date-based and price-based reminders.
-    """
-    if not reminders:
-        return None
-
-    today = datetime.now(EST).date()
-    t     = _time_display()
-    lines = []
-    to_remove = []
-
-    for r in reminders:
-        ticker = r["ticker"]
-        action = r["action"]
-        note   = r.get("note", "")
-        emoji  = "🟢" if action == "BUY" else ("🔴" if action == "SELL" else "⏸️")
-
-        # Date-based reminder
-        if r.get("remind_date"):
-            try:
-                remind_dt = datetime.strptime(r["remind_date"], "%Y-%m-%d").date()
-                days_left = (remind_dt - today).days
-                if days_left < 0:
-                    to_remove.append(r)
-                    continue
-                elif days_left == 0:
-                    lines.append(f"🔔 *TODAY* — {emoji} {action} *{ticker}*\n   {note}")
-                    to_remove.append(r)
-                elif days_left <= 3:
-                    lines.append(f"⏰ *In {days_left} day(s)* — {emoji} {action} *{ticker}*\n   {note}")
-                else:
-                    lines.append(f"📅 *{r['remind_date']}* — {emoji} {action} *{ticker}*\n   {note}")
-            except:
-                continue
-
-        # Price-based reminder
-        elif r.get("target_price"):
-            try:
-                target  = float(r["target_price"])
-                data    = get_stock_data(ticker)
-                current = data["current_price"] if data else None
-                if current:
-                    diff_pct = ((current - target) / target * 100)
-                    if action == "BUY" and current <= target * 1.005:
-                        lines.append(f"🔔 *PRICE HIT!* 🟢 BUY *{ticker}* @ ${current:.2f} (target ${target:.2f})\n   {note}")
-                        to_remove.append(r)
-                    elif action == "SELL" and current >= target * 0.995:
-                        lines.append(f"🔔 *PRICE HIT!* 🔴 SELL *{ticker}* @ ${current:.2f} (target ${target:.2f})\n   {note}")
-                        to_remove.append(r)
-                    else:
-                        arrow = "📈" if action == "BUY" else "📉"
-                        lines.append(
-                            f"{arrow} {emoji} {action} *{ticker}* when ${target:.2f} | "
-                            f"Now ${current:.2f} ({diff_pct:+.1f}% away)\n   {note}"
-                        )
-                else:
-                    lines.append(f"{emoji} {action} *{ticker}* @ ${target:.2f} | {note}")
-            except:
-                continue
-
-    # Clean up fired reminders
-    for r in to_remove:
-        if r in reminders:
-            reminders.remove(r)
-    if to_remove:
-        save_reminders(reminders)
-
-    if not lines:
-        return None
-
-    msg  = "🔔 *REMINDERS*\n"
-    msg += f"_{t['sgt']} | {t['est']}_\n\n"
-    msg += "\n".join(lines)
-    msg += "\n\n_/reminders to manage | /remind TICKER to add new_"
-    return msg
-OPTION_HUNT_TICKERS = [
-    # Broad ETFs
-    "SPY", "QQQ", "IWM", "GLD", "SLV",
-    # Mega-cap tech
-    "AAPL", "MSFT", "NVDA", "META", "AMZN", "GOOGL", "TSLA",
-    # High-beta movers
-    "AMD", "CRWD", "PLTR", "COIN", "MSTR", "SNOW", "SOFI",
-    # Semiconductors
-    "TSM", "AMAT", "MU", "AVGO", "QCOM", "ARM", "MRVL",
-    # Financials
-    "JPM", "GS", "BAC", "MS", "C",
-    # Healthcare
-    "UNH", "JNJ", "PFE", "MRNA", "HIMS",
-    # Energy
-    "XOM", "CVX", "SCCO",
-    # Consumer / media
-    "NFLX", "DIS", "SBUX", "NKE",
-    # Fintech / growth
-    "PYPL", "SQ", "UBER", "ABNB", "SHOP",
-    # AI infrastructure (added after CRWV/NBIS miss)
-    "CRWV", "NBIS", "APLD",
-    # Watchlist additions (Ian's full list)
-    "AXON", "PANW", "BABA", "ZIM", "HIVE",
-    # Ian's holdings (optionable)
-    "RKLB", "ALAB", "GRAB", "NVDL", "IREN", "SCHD",
-]
-
-# --- Earnings watch: these trigger pre-earnings PUT alerts ---
-# Format: "TICKER": "YYYY-MM-DD" (expected earnings date)
-# Update weekly — bot will warn 1-2 days before
-EARNINGS_CALENDAR = {
-    "PLTR": "2026-05-04",
-    "RKLB": "2026-05-13",
-    "AMD":  "2026-05-05",
-    "NVDA": "2026-05-28",
-    "AXON": "2026-05-06",
-    "CRWV": "2026-05-14",
-    "NBIS": "2026-05-12",
-    "HIMS": "2026-05-05",
-    "TSLA": "2026-07-22",
-    "NFLX": "2026-07-16",
-    "META": "2026-04-30",
-    "AMZN": "2026-05-01",
-    "AAPL": "2026-05-01",
-    "MSFT": "2026-04-30",
-    "GOOGL":"2026-04-29",
-}
-
-# --- Swing Trade Configuration ---
-SWING_CAPITAL       = 2000    # Total capital allocated for swing trades (SGD/USD)
-SWING_MAX_TRADES    = 2       # Max simultaneous swing positions
-SWING_HOLD_DAYS     = 2       # Max hold days before forced exit
-SWING_MIN_PRICE     = 5.0     # Ignore penny stocks below this price
-SWING_MIN_RR        = 2.0     # Minimum risk/reward ratio to qualify
-SWING_TARGET1_PCT   = 0.05    # First target: +5% (sell 50%)
-SWING_TARGET2_PCT   = 0.10    # Second target: +10% (sell remaining 50%)
-
-# VIX-calibrated risk per trade
-SWING_RISK = {
-    "low":      0.03,   # VIX < 20  → risk 3% of capital = $60
-    "medium":   0.02,   # VIX 20-25 → risk 2% = $40
-    "high":     0.01,   # VIX > 25  → risk 1% = $20
-}
-
-# --- Signal thresholds (per strategy doc) ---
+# --- Signal thresholds ---
 BUY_STRONG  =  5
 BUY_MEDIUM  =  4
 SELL_WEAK   = -2
 SELL_STRONG = -4
+MIN_CONFIDENCE = 0.60   # Minimum confidence to send any alert
+WATCHLIST_MAX_PER_CYCLE = 3  # Max watchlist alerts per scan cycle
+
+# --- Cooldown: don't re-alert same ticker within this window ---
+ALERT_COOLDOWN_MINUTES = 60
+
+# --- Stop loss ---
+STOP_LOSS_PCT = 0.035
 
 # --- Options filters ---
-OPT_MIN_OI      = 500     # Minimum open interest
-OPT_MIN_DTE     = 21      # Min days to expiry
-OPT_MAX_DTE     = 35      # Max days to expiry
-OPT_MAX_IV      = 50.0    # Max implied volatility % (avoid expensive premiums)
-OPT_OTM_MIN     = 0.01    # Strike at least 1% OTM
-OPT_OTM_MAX     = 0.10    # Strike at most 10% OTM
-PRICE_DIFF_GATE = 0.005   # Block alert if Polygon/yfinance differ by >0.5%
+OPT_MIN_OI  = 500
+OPT_MIN_DTE = 21
+OPT_MAX_DTE = 35
+OPT_MAX_IV  = 50.0
+OPT_OTM_MIN = 0.01
+OPT_OTM_MAX = 0.10
 
-# --- Risk management (per strategy doc) ---
-STOP_LOSS_PCT = 0.035     # 3.5% stop loss (regular market)
+# --- Swing trade config ---
+SWING_MAX_TRADES  = 2
+SWING_HOLD_DAYS   = 2
+SWING_MIN_PRICE   = 5.0
+SWING_MIN_RR      = 2.0
+SWING_TARGET1_PCT = 0.05
+SWING_TARGET2_PCT = 0.10
+SWING_RISK = {"low": 0.03, "medium": 0.02, "high": 0.01}
+
+# ============================================================================
+# PORTFOLIO DATABASE — Single Source of Truth
+# Supports both STOCK and OPTION positions
+# ============================================================================
+"""
+Schema:
+  portfolio.json = {
+    "RKLB_stock": {
+      "asset_type": "stock",          # "stock" | "call" | "put"
+      "ticker": "RKLB",
+      "shares": 67,
+      "avg_cost": 68.439,
+      "entry_date": "2025-01-15",
+      # options-only fields (null for stocks):
+      "strike": null,
+      "expiry": null,
+      "contracts": null
+    },
+    "NVDA_call_200_2026-06-18": {
+      "asset_type": "call",
+      "ticker": "NVDA",
+      "shares": null,
+      "avg_cost": 12.00,              # premium paid per share (×100 = contract cost)
+      "entry_date": "2026-04-24",
+      "strike": 200.0,
+      "expiry": "2026-06-18",
+      "contracts": 1
+    }
+  }
+"""
+
+PORTFOLIO_FILE  = "portfolio.json"
+WATCHLIST_FILE  = "watchlist.json"
+SETTINGS_FILE   = "settings.json"
+REMINDERS_FILE  = "reminders.json"
+ALERT_STATE_FILE = "alert_state.json"   # Tracks last alert per ticker for dedup
+
+# --- Default portfolio (Apr 24 2026) ---
+DEFAULT_PORTFOLIO = {
+    "RKLB_stock":            {"asset_type": "stock",  "ticker": "RKLB",  "shares": 67,  "avg_cost": 68.439,  "entry_date": "2025-01-01", "strike": None, "expiry": None, "contracts": None},
+    "NVDA_stock":            {"asset_type": "stock",  "ticker": "NVDA",  "shares": 10,  "avg_cost": 175.90,  "entry_date": "2025-01-01", "strike": None, "expiry": None, "contracts": None},
+    "NVDA_call_200_20260618":{"asset_type": "call",   "ticker": "NVDA",  "shares": None,"avg_cost": 12.00,   "entry_date": "2026-04-24", "strike": 200.0,"expiry": "2026-06-18","contracts": 1},
+    "ALAB_stock":            {"asset_type": "stock",  "ticker": "ALAB",  "shares": 2,   "avg_cost": 116.00,  "entry_date": "2025-01-01", "strike": None, "expiry": None, "contracts": None},
+    "NVDL_stock":            {"asset_type": "stock",  "ticker": "NVDL",  "shares": 10,  "avg_cost": 80.90,   "entry_date": "2025-01-01", "strike": None, "expiry": None, "contracts": None},
+    "AMZN_stock":            {"asset_type": "stock",  "ticker": "AMZN",  "shares": 2,   "avg_cost": 246.99,  "entry_date": "2026-04-24", "strike": None, "expiry": None, "contracts": None},
+    "AMZN_call_270_20260515":{"asset_type": "call",   "ticker": "AMZN",  "shares": None,"avg_cost": 5.65,    "entry_date": "2026-04-24", "strike": 270.0,"expiry": "2026-05-15","contracts": 1},
+    "META_call_715_20260508": {"asset_type": "call",  "ticker": "META",  "shares": None,"avg_cost": 8.85,    "entry_date": "2026-04-24", "strike": 715.0,"expiry": "2026-05-08","contracts": 1},
+    "MSFT_stock":            {"asset_type": "stock",  "ticker": "MSFT",  "shares": 2,   "avg_cost": 372.50,  "entry_date": "2025-01-01", "strike": None, "expiry": None, "contracts": None},
+    "NBIS_stock":            {"asset_type": "stock",  "ticker": "NBIS",  "shares": 2,   "avg_cost": 114.90,  "entry_date": "2025-01-01", "strike": None, "expiry": None, "contracts": None},
+    "SCHD_stock":            {"asset_type": "stock",  "ticker": "SCHD",  "shares": 15,  "avg_cost": 30.50,   "entry_date": "2025-01-01", "strike": None, "expiry": None, "contracts": None},
+    "TSLA_stock":            {"asset_type": "stock",  "ticker": "TSLA",  "shares": 4,   "avg_cost": 375.00,  "entry_date": "2026-04-24", "strike": None, "expiry": None, "contracts": None},
+    "PANW_stock":            {"asset_type": "stock",  "ticker": "PANW",  "shares": 2,   "avg_cost": 175.00,  "entry_date": "2026-04-24", "strike": None, "expiry": None, "contracts": None},
+    "ASTS_stock":            {"asset_type": "stock",  "ticker": "ASTS",  "shares": 5,   "avg_cost": 79.80,   "entry_date": "2026-04-24", "strike": None, "expiry": None, "contracts": None},
+    "GE_stock":              {"asset_type": "stock",  "ticker": "GE",    "shares": 3,   "avg_cost": 285.33,  "entry_date": "2026-04-24", "strike": None, "expiry": None, "contracts": None},
+    "GOOGL_stock":           {"asset_type": "stock",  "ticker": "GOOGL", "shares": 2,   "avg_cost": 337.50,  "entry_date": "2026-04-24", "strike": None, "expiry": None, "contracts": None},
+    "GOOGL_call_340_20260515":{"asset_type": "call",  "ticker": "GOOGL", "shares": None,"avg_cost": 13.15,   "entry_date": "2026-04-24", "strike": 340.0,"expiry": "2026-05-15","contracts": 1},
+    "GRAB_stock":            {"asset_type": "stock",  "ticker": "GRAB",  "shares": 284, "avg_cost": 5.899,   "entry_date": "2025-01-01", "strike": None, "expiry": None, "contracts": None},
+}
+
+DEFAULT_WATCHLIST = [
+    "AXON", "SOFI", "BABA", "ZIM", "HIVE", "CRWV", "PLTR", "AMD",
+    "COIN", "MSTR", "ARM", "MRVL", "AVGO",
+]
+
+EARNINGS_CALENDAR = {
+    "PLTR":  "2026-05-04",
+    "RKLB":  "2026-05-13",
+    "AMD":   "2026-05-05",
+    "NVDA":  "2026-05-28",
+    "AXON":  "2026-05-06",
+    "CRWV":  "2026-05-14",
+    "NBIS":  "2026-05-12",
+    "HIMS":  "2026-05-05",
+    "TSLA":  "2026-07-22",
+    "NFLX":  "2026-07-16",
+    "META":  "2026-04-30",
+    "AMZN":  "2026-05-01",
+    "AAPL":  "2026-05-01",
+    "MSFT":  "2026-04-30",
+    "GOOGL": "2026-04-29",
+    "PANW":  "2026-05-20",
+    "ASTS":  "2026-05-08",
+    "GE":    "2026-04-22",
+}
+
+OPTION_HUNT_TICKERS = [
+    "SPY","QQQ","IWM","GLD","SLV",
+    "AAPL","MSFT","NVDA","META","AMZN","GOOGL","TSLA",
+    "AMD","CRWD","PLTR","COIN","MSTR","SNOW","SOFI",
+    "TSM","AMAT","MU","AVGO","QCOM","ARM","MRVL",
+    "JPM","GS","BAC","MS","C",
+    "UNH","JNJ","PFE","MRNA","HIMS",
+    "XOM","CVX","SCCO",
+    "NFLX","DIS","SBUX","NKE",
+    "PYPL","SQ","UBER","ABNB","SHOP",
+    "CRWV","NBIS","APLD",
+    "AXON","PANW","BABA","ZIM","HIVE",
+    "RKLB","ALAB","GRAB","NVDL","IREN","SCHD","ASTS","GE",
+]
 
 
 # ============================================================================
-# DATA LAYER (yfinance — free, no API key, no rate limits)
+# PERSISTENCE LAYER
+# ============================================================================
+
+def load_json(path, default):
+    try:
+        if os.path.exists(path):
+            with open(path, "r") as f:
+                return json.load(f)
+    except Exception as e:
+        logger.warning(f"Could not load {path}: {e}")
+    return default() if callable(default) else default
+
+def save_json(path, data):
+    try:
+        with open(path, "w") as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        logger.error(f"Could not save {path}: {e}")
+
+def load_portfolio():
+    data = load_json(PORTFOLIO_FILE, None)
+    if data:
+        logger.info(f"✅ Portfolio loaded ({len(data)} positions)")
+        return data
+    logger.info("📋 Using default portfolio")
+    return {k: dict(v) for k, v in DEFAULT_PORTFOLIO.items()}
+
+def save_portfolio(p):
+    save_json(PORTFOLIO_FILE, p)
+
+def load_watchlist():
+    data = load_json(WATCHLIST_FILE, None)
+    if data is not None:
+        return data
+    return list(DEFAULT_WATCHLIST)
+
+def save_watchlist(w):
+    save_json(WATCHLIST_FILE, w)
+
+def load_settings():
+    return load_json(SETTINGS_FILE, {"swing_capital": 2000, "name": ""})
+
+def save_settings(s):
+    save_json(SETTINGS_FILE, s)
+
+def load_reminders():
+    return load_json(REMINDERS_FILE, [])
+
+def save_reminders(r):
+    save_json(REMINDERS_FILE, r)
+
+def load_alert_state():
+    return load_json(ALERT_STATE_FILE, {})
+
+def save_alert_state(s):
+    save_json(ALERT_STATE_FILE, s)
+
+# Live state
+live_portfolio = load_portfolio()
+live_watchlist = load_watchlist()
+user_settings  = load_settings()
+reminders      = load_reminders()
+alert_state    = load_alert_state()  # {ticker: last_alert_iso_timestamp}
+
+
+# ============================================================================
+# PORTFOLIO HELPERS
+# ============================================================================
+
+def _make_position_key(ticker, asset_type, strike=None, expiry=None):
+    """Generate a unique key for a portfolio position."""
+    t = ticker.upper()
+    if asset_type == "stock":
+        return f"{t}_stock"
+    elif asset_type in ("call", "put"):
+        s = str(int(strike)) if strike else "0"
+        e = expiry.replace("-", "") if expiry else "0"
+        return f"{t}_{asset_type}_{s}_{e}"
+    return f"{t}_{asset_type}"
+
+def get_stock_tickers_from_portfolio():
+    """Return unique stock tickers held (for data fetching)."""
+    tickers = set()
+    for pos in live_portfolio.values():
+        tickers.add(pos["ticker"])
+    return list(tickers)
+
+def get_option_positions():
+    """Return list of option positions (calls and puts)."""
+    return {k: v for k, v in live_portfolio.items() if v["asset_type"] in ("call", "put")}
+
+def get_stock_positions():
+    """Return list of stock-only positions."""
+    return {k: v for k, v in live_portfolio.items() if v["asset_type"] == "stock"}
+
+
+# ============================================================================
+# DATA LAYER
 # ============================================================================
 
 def get_stock_data(ticker):
-    """
-    Fetch live quote + 6-month OHLCV history using yfinance.
-    Single source — free tier, no API key required.
-    """
+    """Fetch live quote + 6-month OHLCV via yfinance."""
     try:
         stock = yf.Ticker(ticker)
-
-        # --- Live quote (fast_info is an object, not a dict) ---
-        info          = stock.fast_info
+        info  = stock.fast_info
         current_price = getattr(info, "last_price", None) or getattr(info, "regular_market_price", None)
         prev_close    = getattr(info, "previous_close", None) or getattr(info, "regular_market_previous_close", None)
 
         if not current_price or float(current_price) == 0:
-            logger.warning(f"No price from yfinance for {ticker}")
             return None
 
         current_price = float(current_price)
@@ -427,14 +328,10 @@ def get_stock_data(ticker):
         daily_change  = current_price - prev_close
         daily_pct     = (daily_change / prev_close * 100) if prev_close else 0
 
-        # --- Historical OHLCV (6 months for indicators) ---
-        hist = yf.download(ticker, period="6mo", interval="1d",
-                           progress=False, auto_adjust=True)
+        hist = yf.download(ticker, period="6mo", interval="1d", progress=False, auto_adjust=True)
         if hist.empty:
-            logger.warning(f"No historical data from yfinance for {ticker}")
             return None
 
-        # Flatten MultiIndex columns if present
         if hasattr(hist.columns, "levels"):
             hist.columns = hist.columns.get_level_values(0)
 
@@ -454,20 +351,8 @@ def get_stock_data(ticker):
         return None
 
 
-def validate_price(ticker, price):
-    """
-    Now that yfinance is the single source, validation is a no-op.
-    Kept for compatibility — always returns valid with the same price.
-    """
-    return True, price, 0.0
-
-
-# ============================================================================
-# VIX (yfinance only — single call, no Polygon cost)
-# ============================================================================
-
 def get_vix():
-    """Fetch VIX from yfinance and classify market sentiment."""
+    """Fetch VIX and classify sentiment."""
     try:
         info = yf.Ticker("^VIX").fast_info
         vix  = getattr(info, "last_price", None) or getattr(info, "regular_market_price", None)
@@ -487,96 +372,193 @@ def get_vix():
             sentiment, emoji = "😱 PANIC — best dip-buy time, tiny sizing", "🔴🔴"
 
         return {
-            "level":         vix,
-            "sentiment":     sentiment,
-            "emoji":         emoji,
-            "is_fearful":    vix > 25,
-            "call_friendly": vix < 20,
+            "level": vix, "sentiment": sentiment, "emoji": emoji,
+            "is_fearful": vix > 25, "call_friendly": vix < 20,
         }
     except Exception as e:
         logger.error(f"VIX error: {e}")
         return None
 
 
+def get_option_value(pos, stock_price):
+    """
+    Estimate current option P&L using intrinsic value approximation.
+    For display purposes only — real value needs live options chain.
+    """
+    try:
+        strike   = pos["strike"]
+        avg_cost = pos["avg_cost"]      # Premium paid per share
+        contracts = pos["contracts"] or 1
+        expiry   = pos["expiry"]
+
+        if expiry:
+            today    = datetime.now(EST).date()
+            exp_date = datetime.strptime(expiry, "%Y-%m-%d").date()
+            dte      = (exp_date - today).days
+            if dte < 0:
+                return {"status": "EXPIRED", "value": 0, "pnl": -(avg_cost * 100 * contracts)}
+        else:
+            dte = 30
+
+        # Try to fetch live price from yfinance options chain
+        ticker_obj = yf.Ticker(pos["ticker"])
+        live_premium = None
+        try:
+            if expiry and expiry in ticker_obj.options:
+                chain = ticker_obj.option_chain(expiry)
+                df = chain.calls if pos["asset_type"] == "call" else chain.puts
+                row = df[abs(df["strike"] - strike) < 0.5]
+                if not row.empty:
+                    bid  = float(row.iloc[0].get("bid", 0) or 0)
+                    ask  = float(row.iloc[0].get("ask", 0) or 0)
+                    last = float(row.iloc[0].get("lastPrice", 0) or 0)
+                    live_premium = (bid + ask) / 2 if bid and ask else last
+        except:
+            pass
+
+        if live_premium is not None and live_premium > 0:
+            current_value = live_premium * 100 * contracts
+            cost_basis    = avg_cost * 100 * contracts
+            pnl           = current_value - cost_basis
+            pnl_pct       = (pnl / cost_basis * 100) if cost_basis else 0
+            return {
+                "status":       f"{dte}DTE",
+                "value":        current_value,
+                "pnl":          pnl,
+                "pnl_pct":      pnl_pct,
+                "live_premium": live_premium,
+            }
+
+        # Fallback: intrinsic only
+        if pos["asset_type"] == "call":
+            intrinsic = max(0, stock_price - strike)
+        else:
+            intrinsic = max(0, strike - stock_price)
+
+        est_value = (intrinsic * 0.7 + avg_cost * 0.3) * 100 * contracts
+        cost_basis = avg_cost * 100 * contracts
+        pnl = est_value - cost_basis
+        pnl_pct = (pnl / cost_basis * 100) if cost_basis else 0
+        return {
+            "status":  f"{dte}DTE (est.)",
+            "value":   est_value,
+            "pnl":     pnl,
+            "pnl_pct": pnl_pct,
+            "live_premium": None,
+        }
+    except Exception as e:
+        logger.warning(f"get_option_value: {e}")
+        return None
+
+
 # ============================================================================
-# EARNINGS ALERT ENGINE
+# CATALYST DETECTION — News via Finnhub
 # ============================================================================
+
+def get_news_catalyst(ticker):
+    """
+    Fetch recent news for ticker via Finnhub.
+    Returns catalyst summary, impact (bullish/bearish/neutral), and suggested action.
+    """
+    if not FINNHUB_KEY:
+        return None
+    try:
+        today    = datetime.now(EST)
+        from_dt  = (today - timedelta(days=2)).strftime("%Y-%m-%d")
+        to_dt    = today.strftime("%Y-%m-%d")
+        url      = f"https://finnhub.io/api/v1/company-news?symbol={ticker}&from={from_dt}&to={to_dt}&token={FINNHUB_KEY}"
+        resp     = requests.get(url, timeout=5)
+        if resp.status_code != 200:
+            return None
+        articles = resp.json()[:5]  # Latest 5
+        if not articles:
+            return None
+
+        # Simple keyword-based sentiment on headlines
+        bullish_kw = ["beat", "beats", "upgrade", "raises guidance", "record", "surge", "strong",
+                      "better than expected", "partnership", "contract", "bullish", "buy"]
+        bearish_kw = ["miss", "misses", "downgrade", "cut", "layoff", "weak", "below", "warning",
+                      "investigation", "lawsuit", "recall", "bearish", "sell"]
+
+        bull_count = bear_count = 0
+        headlines  = []
+        for art in articles:
+            h = art.get("headline", "").lower()
+            headlines.append(art.get("headline", ""))
+            bull_count += sum(1 for kw in bullish_kw if kw in h)
+            bear_count += sum(1 for kw in bearish_kw if kw in h)
+
+        if bull_count > bear_count and bull_count > 0:
+            impact  = "🟢 Bullish"
+            action  = "Consider adding / holding"
+        elif bear_count > bull_count and bear_count > 0:
+            impact  = "🔴 Bearish"
+            action  = "Consider reducing / protecting"
+        else:
+            impact  = "⚪ Neutral"
+            action  = "No action indicated"
+
+        return {
+            "headlines": headlines[:3],
+            "impact":    impact,
+            "action":    action,
+            "bull_count": bull_count,
+            "bear_count": bear_count,
+        }
+    except Exception as e:
+        logger.warning(f"News catalyst {ticker}: {e}")
+        return None
+
+
+def _is_volume_spike(data):
+    """Returns True if today's volume is >1.5× 20-day average."""
+    try:
+        vols = data.get("volumes", [])
+        if len(vols) < 21:
+            return False
+        avg_vol   = np.mean(vols[-21:-1])
+        vol_ratio = vols[-1] / avg_vol if avg_vol > 0 else 1.0
+        return vol_ratio >= 1.5, round(vol_ratio, 1)
+    except:
+        return False, 1.0
+
 
 def check_earnings_alerts():
-    """
-    Scans EARNINGS_CALENDAR for stocks reporting in 1-2 days.
-    Returns list of earnings alerts with PUT/CALL bias based on recent trend.
-    Fires pre-market so you can position BEFORE the move.
-    """
+    """Scan earnings calendar for stocks reporting in 1-2 days."""
     alerts = []
     today  = datetime.now(EST).date()
-
     for ticker, date_str in EARNINGS_CALENDAR.items():
         try:
             earn_date = datetime.strptime(date_str, "%Y-%m-%d").date()
             days_away = (earn_date - today).days
-
             if days_away < 0 or days_away > 2:
-                continue  # Already passed or too far out
-
-            # Get recent price trend for bias
-            data = get_stock_data(ticker)
-            trend = "neutral"
-            score = 0
+                continue
+            data   = get_stock_data(ticker)
+            score  = 0
+            trend  = "neutral"
             if data:
                 scored = score_ticker(data)
                 if scored:
                     score = scored["score"]
-                    if score >= 2:
-                        trend = "bullish"
-                    elif score <= -2:
-                        trend = "bearish"
-
-            # Bias logic for earnings plays
-            if trend == "bearish":
-                bias = "🔴 PUT candidate"
-                reason = "Bearish indicators into earnings — consider protective put"
-            elif trend == "bullish":
-                bias = "🟢 CALL candidate"
-                reason = "Bullish momentum into earnings — consider call if IV not too high"
-            else:
-                bias = "⚪ NEUTRAL — high risk"
-                reason = "Mixed signals — avoid options, earnings binary event"
-
+                    trend = "bullish" if score >= 2 else ("bearish" if score <= -2 else "neutral")
+            bias = (
+                "🟢 CALL candidate" if trend == "bullish" else
+                "🔴 PUT candidate"  if trend == "bearish" else
+                "⚪ NEUTRAL — high risk"
+            )
+            reason = (
+                "Bullish momentum into earnings — CALL if IV not too high" if trend == "bullish" else
+                "Bearish into earnings — protective PUT" if trend == "bearish" else
+                "Mixed signals — avoid options on this binary event"
+            )
             alerts.append({
-                "ticker":    ticker,
-                "earn_date": date_str,
-                "days_away": days_away,
-                "bias":      bias,
-                "reason":    reason,
-                "score":     score,
+                "ticker": ticker, "earn_date": date_str,
+                "days_away": days_away, "bias": bias,
+                "reason": reason, "score": score,
             })
         except Exception as e:
             logger.warning(f"Earnings check {ticker}: {e}")
-
     return alerts
-
-
-def format_earnings_alerts(alerts):
-    """Format earnings alert message for Telegram."""
-    if not alerts:
-        return None
-
-    t   = _time_display()
-    msg = "📅 *EARNINGS ALERT — OPTIONS WATCH*\n"
-    msg += f"_{t['sgt']} | {t['est']}_\n\n"
-    msg += "⚡ *Stocks reporting in 1-2 days — act BEFORE open:*\n\n"
-
-    for a in alerts:
-        day_label = "TODAY after close" if a["days_away"] == 0 else (
-                    "TOMORROW" if a["days_away"] == 1 else "In 2 days")
-        msg += f"{a['bias']}: *{a['ticker']}*\n"
-        msg += f"Earnings: {a['earn_date']} ({day_label})\n"
-        msg += f"Tech score: {a['score']:+d}/6 | {a['reason']}\n"
-        msg += f"⚠️ IV will spike at open — buy options NOW, not after report\n\n"
-
-    msg += "_Earnings = binary risk. Max 1% capital per trade. Exit before close on earnings day._"
-    return msg
 
 
 # ============================================================================
@@ -584,93 +566,83 @@ def format_earnings_alerts(alerts):
 # ============================================================================
 
 def _ema(closes, period):
-    """Exponential Moving Average."""
     try:
         arr = np.array(closes, dtype=float)
         if len(arr) < period:
             return None
-        k = 2.0 / (period + 1)
-        ema = arr[0]
+        k, ema = 2.0 / (period + 1), arr[0]
         for p in arr[1:]:
             ema = p * k + ema * (1 - k)
         return ema
     except:
         return None
 
-
 def _rsi(closes, period=14):
-    """RSI — Relative Strength Index."""
     try:
-        arr = np.array(closes[-(period + 1):], dtype=float)
+        arr    = np.array(closes[-(period + 1):], dtype=float)
         if len(arr) < period + 1:
             return None
-        deltas = np.diff(arr)
+        deltas   = np.diff(arr)
         avg_gain = np.mean(np.where(deltas > 0, deltas, 0))
         avg_loss = np.mean(np.where(deltas < 0, -deltas, 0))
-        if avg_loss == 0:
-            return 100.0
-        return 100 - (100 / (1 + avg_gain / avg_loss))
+        return 100.0 if avg_loss == 0 else 100 - (100 / (1 + avg_gain / avg_loss))
     except:
         return None
 
-
 def _macd(closes, fast=12, slow=26, signal=9):
-    """MACD line and signal line."""
     try:
         if len(closes) < slow + signal:
             return None, None
-        # Build rolling MACD values for signal calculation
         macd_vals = []
         for i in range(slow, len(closes) + 1):
             ef = _ema(closes[:i], fast)
             es = _ema(closes[:i], slow)
-            if ef is not None and es is not None:
+            if ef and es:
                 macd_vals.append(ef - es)
         if len(macd_vals) < signal:
             return None, None
-        macd_line   = macd_vals[-1]
-        signal_line = float(np.mean(macd_vals[-signal:]))
-        return macd_line, signal_line
+        return macd_vals[-1], float(np.mean(macd_vals[-signal:]))
     except:
         return None, None
 
-
 def _bollinger(closes, period=20, std_devs=2):
-    """Bollinger Bands (upper, middle, lower)."""
     try:
         arr = np.array(closes[-period:], dtype=float)
         if len(arr) < period:
             return None
-        sma = np.mean(arr)
-        std = np.std(arr)
+        sma, std = np.mean(arr), np.std(arr)
         return {"upper": sma + std_devs * std, "middle": sma, "lower": sma - std_devs * std}
     except:
         return None
 
-
 def _adx(highs, lows, closes, period=14):
-    """Average Directional Index."""
     try:
-        h = np.array(highs, dtype=float)
-        l = np.array(lows, dtype=float)
-        c = np.array(closes, dtype=float)
+        h, l, c = np.array(highs, dtype=float), np.array(lows, dtype=float), np.array(closes, dtype=float)
         if len(c) < period + 2:
             return None
         trs, plus_dms, minus_dms = [], [], []
         for i in range(1, len(c)):
             trs.append(max(h[i] - l[i], abs(h[i] - c[i-1]), abs(l[i] - c[i-1])))
-            up   = h[i] - h[i-1]
-            down = l[i-1] - l[i]
+            up, down = h[i] - h[i-1], l[i-1] - l[i]
             plus_dms.append(up   if up   > down and up   > 0 else 0)
             minus_dms.append(down if down > up   and down > 0 else 0)
         atr = np.mean(trs[-period:])
         if atr == 0:
             return None
-        plus_di  = 100 * np.mean(plus_dms[-period:])  / atr
+        plus_di  = 100 * np.mean(plus_dms[-period:]) / atr
         minus_di = 100 * np.mean(minus_dms[-period:]) / atr
-        denom = plus_di + minus_di
-        dx = 100 * abs(plus_di - minus_di) / denom if denom > 0 else 0
-        return dx
+        denom    = plus_di + minus_di
+        return 100 * abs(plus_di - minus_di) / denom if denom > 0 else 0
+    except:
+        return None
+
+def _atr(highs, lows, closes, period=14):
+    try:
+        h = np.array(highs[-period-1:], dtype=float)
+        l = np.array(lows[-period-1:],  dtype=float)
+        c = np.array(closes[-period-1:], dtype=float)
+        trs = [max(h[i]-l[i], abs(h[i]-c[i-1]), abs(l[i]-c[i-1])) for i in range(1, len(c))]
+        return np.mean(trs) if trs else None
     except:
         return None
 
@@ -680,204 +652,512 @@ def _adx(highs, lows, closes, period=14):
 # ============================================================================
 
 def score_ticker(data):
-    """
-    Score a ticker -6 to +6 using the 6-indicator system.
-    Score >= 4  → BUY signal
-    Score <= -2 → SELL signal
-    """
     try:
-        closes  = data["closes"]
-        highs   = data["highs"]
-        lows    = data["lows"]
-        volumes = data["volumes"]
-        price   = data["current_price"]
-        pct     = data["daily_change_pct"]
+        closes, highs, lows, volumes = data["closes"], data["highs"], data["lows"], data["volumes"]
+        price, pct = data["current_price"], data["daily_change_pct"]
+        score, details = 0, []
 
-        score   = 0
-        details = []
-
-        # 1. EMA 20/50 — Trend direction
-        ema20 = _ema(closes, 20)
-        ema50 = _ema(closes, 50)
+        ema20, ema50 = _ema(closes, 20), _ema(closes, 50)
         if ema20 and ema50:
             if ema20 > ema50:
-                score += 1
-                details.append(f"✅ EMA20 ${ema20:.2f} > EMA50 ${ema50:.2f} (uptrend)")
+                score += 1; details.append(f"✅ EMA20 ${ema20:.2f} > EMA50 ${ema50:.2f} (uptrend)")
             elif ema20 < ema50:
-                score -= 1
-                details.append(f"❌ EMA20 ${ema20:.2f} < EMA50 ${ema50:.2f} (downtrend)")
+                score -= 1; details.append(f"❌ EMA20 ${ema20:.2f} < EMA50 ${ema50:.2f} (downtrend)")
 
-        # 2. RSI — Momentum extremes
         rsi = _rsi(closes)
         if rsi is not None:
             if rsi < 30:
-                score += 1
-                details.append(f"✅ RSI {rsi:.1f} — oversold (bounce likely)")
+                score += 1; details.append(f"✅ RSI {rsi:.1f} — oversold (bounce likely)")
             elif rsi > 70:
-                score -= 1
-                details.append(f"❌ RSI {rsi:.1f} — overbought (reversal risk)")
+                score -= 1; details.append(f"❌ RSI {rsi:.1f} — overbought (reversal risk)")
             else:
                 details.append(f"➖ RSI {rsi:.1f} — neutral")
 
-        # 3. MACD — Momentum cross
         macd_line, signal_line = _macd(closes)
         if macd_line is not None and signal_line is not None:
             if macd_line > signal_line:
-                score += 1
-                details.append(f"✅ MACD {macd_line:.3f} > Signal {signal_line:.3f} (bullish)")
+                score += 1; details.append(f"✅ MACD {macd_line:.3f} > Signal {signal_line:.3f} (bullish)")
             else:
-                score -= 1
-                details.append(f"❌ MACD {macd_line:.3f} < Signal {signal_line:.3f} (bearish)")
+                score -= 1; details.append(f"❌ MACD {macd_line:.3f} < Signal {signal_line:.3f} (bearish)")
 
-        # 4. Bollinger Bands — Support/resistance extremes
         bb = _bollinger(closes)
         if bb:
             if price <= bb["lower"]:
-                score += 1
-                details.append(f"✅ At BB lower ${bb['lower']:.2f} (support bounce)")
+                score += 1; details.append(f"✅ At BB lower ${bb['lower']:.2f} (support bounce)")
             elif price >= bb["upper"]:
-                score -= 1
-                details.append(f"❌ At BB upper ${bb['upper']:.2f} (resistance)")
+                score -= 1; details.append(f"❌ At BB upper ${bb['upper']:.2f} (resistance)")
             else:
                 details.append(f"➖ BB mid-range (${bb['lower']:.2f}—${bb['upper']:.2f})")
 
-        # 5. Volume — Conviction confirmation
         if len(volumes) >= 20:
-            avg_vol = np.mean(volumes[-20:])
+            avg_vol   = np.mean(volumes[-20:])
             vol_ratio = volumes[-1] / avg_vol if avg_vol > 0 else 1.0
             if vol_ratio >= 1.5:
                 if pct >= 0:
-                    score += 1
-                    details.append(f"✅ Volume {vol_ratio:.1f}x avg (buying conviction)")
+                    score += 1; details.append(f"✅ Volume {vol_ratio:.1f}x avg (buying conviction)")
                 else:
-                    score -= 1
-                    details.append(f"❌ Volume {vol_ratio:.1f}x avg (selling pressure)")
+                    score -= 1; details.append(f"❌ Volume {vol_ratio:.1f}x avg (selling pressure)")
             else:
                 details.append(f"➖ Volume {vol_ratio:.1f}x avg (low conviction)")
 
-        # 6. ADX — Trend strength (amplifies existing direction)
         adx = _adx(highs, lows, closes)
         if adx is not None:
             if adx > 25:
                 adj = 1 if score > 0 else -1
-                score += adj
-                details.append(f"✅ ADX {adx:.1f} — strong trend (confirms direction)")
+                score += adj; details.append(f"✅ ADX {adx:.1f} — strong trend (confirms direction)")
             else:
                 details.append(f"➖ ADX {adx:.1f} — weak/choppy (no confirmation)")
 
-        return {
-            "score":   score,
-            "details": details,
-            "rsi":     rsi,
-            "bb":      bb,
-            "ema20":   ema20,
-            "ema50":   ema50,
-        }
+        return {"score": score, "details": details, "rsi": rsi, "bb": bb, "ema20": ema20, "ema50": ema50}
     except Exception as e:
-        logger.error(f"score_ticker error: {e}")
+        logger.error(f"score_ticker {data.get('ticker')}: {e}")
         return None
 
 
 def classify_signal(score):
-    """Convert numeric score to signal label."""
-    if score >= BUY_STRONG:
-        return "STRONG_BUY"
-    elif score >= BUY_MEDIUM:
-        return "MEDIUM_BUY"
-    elif score <= SELL_STRONG:
-        return "STRONG_SELL"
-    elif score <= SELL_WEAK:
-        return "WEAK_SELL"
+    if score >= BUY_STRONG:  return "STRONG_BUY"
+    if score >= BUY_MEDIUM:  return "MEDIUM_BUY"
+    if score <= SELL_STRONG: return "STRONG_SELL"
+    if score <= SELL_WEAK:   return "WEAK_SELL"
     return None
 
 
+def score_to_confidence(score):
+    """Map score magnitude to confidence percentage."""
+    abs_score = abs(score)
+    if abs_score >= 5: return 0.90
+    if abs_score >= 4: return 0.75
+    if abs_score >= 3: return 0.65
+    if abs_score >= 2: return 0.55
+    return 0.45
+
+
 # ============================================================================
-# OPTION HUNTER — OPTIONS CHAIN
+# SIGNAL QUALITY CONTROL — Deduplication + Confidence Gate
+# ============================================================================
+
+def _should_alert(ticker, signal_type, score):
+    """
+    Returns True if this ticker/signal should fire.
+    Blocks if: confidence < MIN_CONFIDENCE, or same ticker alerted < 1hr ago.
+    """
+    global alert_state
+
+    confidence = score_to_confidence(score)
+    if confidence < MIN_CONFIDENCE:
+        return False, confidence
+
+    now = datetime.now(EST)
+    last_alert = alert_state.get(ticker)
+    if last_alert:
+        try:
+            last_dt   = datetime.fromisoformat(last_alert).replace(tzinfo=EST)
+            elapsed   = (now - last_dt).total_seconds() / 60
+            if elapsed < ALERT_COOLDOWN_MINUTES:
+                return False, confidence
+        except:
+            pass
+
+    return True, confidence
+
+
+def _record_alert(ticker):
+    """Mark this ticker as alerted now."""
+    global alert_state
+    alert_state[ticker] = datetime.now(EST).isoformat()
+    save_alert_state(alert_state)
+
+
+# ============================================================================
+# SIGNAL FORMATTERS — Structured alert format per requirements
+# ============================================================================
+
+def _format_signal_alert(
+    signal_type,    # "PORTFOLIO_PROTECTION" | "PORTFOLIO_GROWTH" | "WATCHLIST_OPPORTUNITY"
+    ticker,
+    price,
+    score,
+    confidence,
+    what_happened,
+    why_it_matters,
+    strategy_note,
+    suggested_action,
+    details,
+    catalyst=None,
+    earn_warning=None,
+):
+    """
+    Unified alert format per requirements:
+      Signal type / Ticker / What / Why / Strategy / Action / Confidence
+    """
+    labels = {
+        "PORTFOLIO_PROTECTION":   "🛡️ PORTFOLIO PROTECTION",
+        "PORTFOLIO_GROWTH":       "🚀 PORTFOLIO GROWTH",
+        "WATCHLIST_OPPORTUNITY":  "🔍 WATCHLIST OPPORTUNITY",
+    }
+    signal_labels = {
+        "STRONG_BUY":  "🟢🟢 STRONG BUY",
+        "MEDIUM_BUY":  "🟢 MEDIUM BUY",
+        "STRONG_SELL": "🔴🔴 STRONG SELL",
+        "WEAK_SELL":   "🔴 TRIM SIGNAL",
+    }
+    sig_class = classify_signal(score)
+    sig_label = signal_labels.get(sig_class, "⏸️ HOLD")
+
+    conf_bar  = "▓" * int(confidence * 10) + "░" * (10 - int(confidence * 10))
+
+    msg  = f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+    msg += f"{labels.get(signal_type, signal_type)}\n"
+    msg += f"{sig_label}: *{ticker}* @ ${price:.2f}\n"
+    msg += f"Score: {score:+d}/6 | Confidence: {confidence:.0%} [{conf_bar}]\n\n"
+    msg += f"📌 *What happened:* {what_happened}\n"
+    msg += f"💡 *Why it matters:* {why_it_matters}\n"
+    msg += f"📐 *Strategy:* {strategy_note}\n"
+    msg += f"✅ *Action:* {suggested_action}\n"
+
+    if catalyst:
+        msg += f"\n📰 *Catalyst:* {catalyst['impact']}\n"
+        for h in catalyst["headlines"][:2]:
+            msg += f"   • {h[:80]}{'…' if len(h)>80 else ''}\n"
+
+    if earn_warning:
+        msg += f"\n⚠️ {earn_warning}\n"
+
+    msg += f"\n*Top signals:*\n"
+    for d in details[:4]:
+        msg += f"  {d}\n"
+
+    msg += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    return msg
+
+
+# ============================================================================
+# PORTFOLIO DATA & P&L
+# ============================================================================
+
+def get_portfolio_pnl():
+    """
+    Returns full P&L breakdown: stocks + options.
+    Also computes daily P&L from prev_close.
+    """
+    total_cost       = total_value    = 0
+    total_daily_pnl  = 0
+    positions        = {}
+    stock_cache      = {}
+
+    # Pre-fetch all unique stock prices
+    for pos in live_portfolio.values():
+        tk = pos["ticker"]
+        if tk not in stock_cache:
+            data = get_stock_data(tk)
+            stock_cache[tk] = data
+
+    for key, pos in live_portfolio.items():
+        tk   = pos["ticker"]
+        data = stock_cache.get(tk)
+        if not data:
+            continue
+
+        price      = data["current_price"]
+        prev_close = data["prev_close"]
+
+        if pos["asset_type"] == "stock":
+            shares   = pos["shares"]
+            avg_cost = pos["avg_cost"]
+            cost     = shares * avg_cost
+            value    = shares * price
+            pnl      = value - cost
+            pnl_pct  = (pnl / cost * 100) if cost > 0 else 0
+            daily_pnl = shares * (price - prev_close)
+
+            total_cost      += cost
+            total_value     += value
+            total_daily_pnl += daily_pnl
+
+            positions[key] = {
+                "key": key, "ticker": tk, "asset_type": "stock",
+                "shares": shares, "avg_cost": avg_cost,
+                "price": price, "cost": cost, "value": value,
+                "pnl": pnl, "pnl_pct": pnl_pct, "daily_pnl": daily_pnl,
+            }
+
+        elif pos["asset_type"] in ("call", "put"):
+            opt = get_option_value(pos, price)
+            if not opt or opt["status"] == "EXPIRED":
+                # Expired = full loss
+                cost = (pos["avg_cost"] * 100 * (pos["contracts"] or 1))
+                positions[key] = {
+                    "key": key, "ticker": tk, "asset_type": pos["asset_type"],
+                    "strike": pos["strike"], "expiry": pos["expiry"],
+                    "contracts": pos["contracts"],
+                    "price": 0, "cost": cost, "value": 0,
+                    "pnl": -cost, "pnl_pct": -100, "daily_pnl": 0,
+                    "status": "EXPIRED",
+                }
+                total_cost  += cost
+                total_daily_pnl += 0
+            else:
+                cost = pos["avg_cost"] * 100 * (pos["contracts"] or 1)
+                total_cost      += cost
+                total_value     += opt["value"]
+                total_daily_pnl += 0   # Options daily P&L hard to compute without prev chain
+
+                positions[key] = {
+                    "key": key, "ticker": tk, "asset_type": pos["asset_type"],
+                    "strike": pos["strike"], "expiry": pos["expiry"],
+                    "contracts": pos["contracts"], "avg_cost": pos["avg_cost"],
+                    "price": opt.get("live_premium", pos["avg_cost"]),
+                    "cost": cost, "value": opt["value"],
+                    "pnl": opt["pnl"], "pnl_pct": opt["pnl_pct"],
+                    "daily_pnl": 0, "status": opt["status"],
+                }
+
+    return {
+        "positions":       positions,
+        "total_value":     total_value,
+        "total_cost":      total_cost,
+        "total_pnl":       total_value - total_cost,
+        "total_pnl_pct":   ((total_value - total_cost) / total_cost * 100) if total_cost else 0,
+        "daily_pnl":       total_daily_pnl,
+        "stock_cache":     stock_cache,
+    }
+
+
+def get_market_metrics():
+    metrics = {}
+    for ticker in ["SPY", "QQQ"]:
+        data = get_stock_data(ticker)
+        if data:
+            metrics[ticker] = {"current": data["current_price"], "daily_pct": data["daily_change_pct"]}
+    return metrics or None
+
+
+# ============================================================================
+# PORTFOLIO SIGNALS — Protection + Growth
+# ============================================================================
+
+def run_portfolio_signals(vix, stock_cache=None):
+    """
+    Scan all portfolio stock positions for Protection and Growth signals.
+    Returns (protection_signals, growth_signals)
+    """
+    protection, growth = [], []
+    if stock_cache is None:
+        stock_cache = {}
+
+    stock_positions = get_stock_positions()
+
+    for key, pos in stock_positions.items():
+        tk = pos["ticker"]
+        try:
+            data = stock_cache.get(tk) or get_stock_data(tk)
+            if not data:
+                continue
+            stock_cache[tk] = data
+
+            scored = score_ticker(data)
+            if not scored:
+                continue
+
+            score      = scored["score"]
+            price      = data["current_price"]
+            avg_cost   = pos["avg_cost"]
+            pnl_pct    = ((price - avg_cost) / avg_cost * 100) if avg_cost else 0
+            signal     = classify_signal(score)
+            confidence = score_to_confidence(score)
+
+            # --- Portfolio Protection: SELL/TRIM signals on held positions ---
+            if signal in ("STRONG_SELL", "WEAK_SELL"):
+                should, conf = _should_alert(tk, "PORTFOLIO_PROTECTION", score)
+                if not should:
+                    continue
+
+                what      = f"{tk} showing {abs(score)}/6 bearish indicators"
+                why       = f"Technical deterioration — P&L currently {pnl_pct:+.1f}% (${(price-avg_cost)*pos['shares']:+.0f})"
+                strategy  = "Staged exit: sell 30-50% to protect gains, hold rest with tighter stop"
+                action    = f"Trim to ${scored['bb']['upper']:.2f} (BB upper)" if scored.get('bb') else "Reduce 30-50% of position"
+                earn_warn = None
+                earn_date = EARNINGS_CALENDAR.get(tk)
+                if earn_date:
+                    days = (datetime.strptime(earn_date, "%Y-%m-%d").date() - datetime.now(EST).date()).days
+                    if 0 <= days <= 5:
+                        earn_warn = f"Earnings in {days} days ({earn_date})"
+
+                protection.append({
+                    "signal_type": "PORTFOLIO_PROTECTION",
+                    "ticker": tk, "price": price, "score": score,
+                    "confidence": conf, "what": what, "why": why,
+                    "strategy": strategy, "action": action,
+                    "details": scored["details"],
+                    "earn_warning": earn_warn,
+                })
+                _record_alert(tk)
+
+            # --- Portfolio Growth: BUY/ADD signals on held positions ---
+            elif signal in ("STRONG_BUY", "MEDIUM_BUY"):
+                # Only flag if reasonable P&L (not over-extended)
+                if pnl_pct > 30 and signal == "MEDIUM_BUY":
+                    continue   # Already up 30%, medium signal not strong enough to add
+
+                should, conf = _should_alert(tk, "PORTFOLIO_GROWTH", score)
+                if not should:
+                    continue
+
+                entry    = scored["bb"]["lower"] if scored.get("bb") else price * 0.99
+                stop     = entry * (1 - STOP_LOSS_PCT)
+                what     = f"{tk} showing {score}/6 bullish indicators"
+                why      = f"Trend and momentum aligning — current P&L {pnl_pct:+.1f}% | adding adds to winner"
+                strategy = "Add at BB lower if signal holds; stop at 3.5% below entry"
+                action   = f"Add shares near ${entry:.2f} | Stop: ${stop:.2f}"
+
+                growth.append({
+                    "signal_type": "PORTFOLIO_GROWTH",
+                    "ticker": tk, "price": price, "score": score,
+                    "confidence": conf, "what": what, "why": why,
+                    "strategy": strategy, "action": action,
+                    "details": scored["details"],
+                })
+                _record_alert(tk)
+
+        except Exception as e:
+            logger.error(f"portfolio_signals {tk}: {e}")
+
+    return protection, growth
+
+
+# ============================================================================
+# WATCHLIST SIGNALS — Opportunity Detection
+# ============================================================================
+
+def run_watchlist_signals(vix):
+    """
+    Scan watchlist for high-confidence buy opportunities.
+    Capped at WATCHLIST_MAX_PER_CYCLE results.
+    Only fires STRONG_BUY (score >= 5) or high-confidence MEDIUM_BUY with catalyst.
+    """
+    opportunities = []
+    count = 0
+
+    for tk in live_watchlist:
+        if count >= WATCHLIST_MAX_PER_CYCLE:
+            break
+        try:
+            data = get_stock_data(tk)
+            if not data:
+                continue
+
+            scored = score_ticker(data)
+            if not scored:
+                continue
+
+            score  = scored["score"]
+            signal = classify_signal(score)
+
+            # Watchlist: only very high confidence signals
+            if score < BUY_STRONG:  # Must be 5+ for watchlist
+                continue
+
+            # VIX gate
+            if vix and vix["level"] > 30:
+                continue
+
+            should, conf = _should_alert(tk, "WATCHLIST_OPPORTUNITY", score)
+            if not should:
+                continue
+
+            price    = data["current_price"]
+            bb       = scored.get("bb")
+            entry    = bb["lower"] if bb else price * 0.99
+            stop     = entry * (1 - STOP_LOSS_PCT)
+            target1  = entry * 1.05
+            target2  = entry * 1.10
+            catalyst = get_news_catalyst(tk)
+
+            earn_warn = None
+            earn_date = EARNINGS_CALENDAR.get(tk)
+            if earn_date:
+                days = (datetime.strptime(earn_date, "%Y-%m-%d").date() - datetime.now(EST).date()).days
+                if 0 <= days <= 5:
+                    earn_warn = f"⚠️ Earnings in {days} days — SKIP options, stock only"
+
+            what     = f"{tk} scoring {score}/6 — strong technical alignment"
+            why      = f"All key indicators bullish: EMA, MACD, and volume confirming"
+            strategy = "Watchlist entry: small size (1% capital), add on confirmation"
+            action   = f"Buy near ${entry:.2f} | Stop: ${stop:.2f} | T1: ${target1:.2f} | T2: ${target2:.2f}"
+
+            opportunities.append({
+                "signal_type": "WATCHLIST_OPPORTUNITY",
+                "ticker": tk, "price": price, "score": score,
+                "confidence": conf, "what": what, "why": why,
+                "strategy": strategy, "action": action,
+                "details": scored["details"],
+                "catalyst": catalyst,
+                "earn_warning": earn_warn,
+            })
+            _record_alert(tk)
+            count += 1
+
+        except Exception as e:
+            logger.error(f"watchlist_signals {tk}: {e}")
+
+    return opportunities
+
+
+# ============================================================================
+# OPTION HUNTER
 # ============================================================================
 
 def get_best_option(ticker, current_price, signal):
-    """
-    Fetch the best option contract from yfinance for a given signal direction.
-    Filters: OI >500, DTE 21-35, IV <50%, strike 1-10% OTM.
-    """
     try:
         stock = yf.Ticker(ticker)
         expirations = stock.options
         if not expirations:
             return None
-
-        # Find best expiry targeting 28 DTE
         today = datetime.now().date()
         best_exp, best_diff = None, 9999
-
         for exp in expirations:
             exp_date = datetime.strptime(exp, "%Y-%m-%d").date()
             dte = (exp_date - today).days
             diff = abs(dte - 28)
             if OPT_MIN_DTE <= dte <= OPT_MAX_DTE and diff < best_diff:
-                best_diff = diff
-                best_exp = exp
-
-        # Fallback: nearest expiry >= 14 DTE
+                best_diff, best_exp = diff, exp
         if not best_exp:
             for exp in expirations:
                 exp_date = datetime.strptime(exp, "%Y-%m-%d").date()
                 if (exp_date - today).days >= 14:
                     best_exp = exp
                     break
-
         if not best_exp:
             return None
 
         chain = stock.option_chain(best_exp)
         dte   = (datetime.strptime(best_exp, "%Y-%m-%d").date() - today).days
         is_call = signal in ("STRONG_BUY", "MEDIUM_BUY")
-
-        if is_call:
-            df          = chain.calls
-            strike_min  = current_price * (1 + OPT_OTM_MIN)
-            strike_max  = current_price * (1 + OPT_OTM_MAX)
-            direction   = "CALL"
-        else:
-            df          = chain.puts
-            strike_min  = current_price * (1 - OPT_OTM_MAX)
-            strike_max  = current_price * (1 - OPT_OTM_MIN)
-            direction   = "PUT"
+        df          = chain.calls if is_call else chain.puts
+        strike_min  = current_price * (1 + OPT_OTM_MIN) if is_call else current_price * (1 - OPT_OTM_MAX)
+        strike_max  = current_price * (1 + OPT_OTM_MAX) if is_call else current_price * (1 - OPT_OTM_MIN)
+        direction   = "CALL" if is_call else "PUT"
 
         filtered = df[
-            (df["strike"] >= strike_min) &
-            (df["strike"] <= strike_max) &
+            (df["strike"] >= strike_min) & (df["strike"] <= strike_max) &
             (df["openInterest"] >= OPT_MIN_OI)
         ]
-
         if filtered.empty:
             return None
-
-        # Most liquid contract first
         filtered = filtered.sort_values("openInterest", ascending=False)
         best = filtered.iloc[0]
-
-        iv = float(best.get("impliedVolatility", 0)) * 100
+        iv   = float(best.get("impliedVolatility", 0)) * 100
         if iv > OPT_MAX_IV:
-            return None  # Premium too expensive
-
-        bid  = float(best.get("bid", 0) or 0)
-        ask  = float(best.get("ask", 0) or 0)
-        last = float(best.get("lastPrice", 0) or 0)
-        mid  = (bid + ask) / 2 if bid and ask else last
-
+            return None
+        bid, ask, last = float(best.get("bid",0) or 0), float(best.get("ask",0) or 0), float(best.get("lastPrice",0) or 0)
+        mid = (bid + ask) / 2 if bid and ask else last
         return {
-            "direction": direction,
-            "strike":    float(best["strike"]),
-            "expiry":    best_exp,
-            "dte":       dte,
-            "last":      last,
-            "mid":       mid,
-            "bid":       bid,
-            "ask":       ask,
-            "oi":        int(best.get("openInterest", 0) or 0),
-            "volume":    int(best.get("volume", 0) or 0),
-            "iv":        round(iv, 1),
+            "direction": direction, "strike": float(best["strike"]),
+            "expiry": best_exp, "dte": dte, "last": last, "mid": mid,
+            "bid": bid, "ask": ask,
+            "oi": int(best.get("openInterest", 0) or 0),
+            "volume": int(best.get("volume", 0) or 0),
+            "iv": round(iv, 1),
         }
     except Exception as e:
         logger.warning(f"Options chain {ticker}: {e}")
@@ -885,111 +1165,152 @@ def get_best_option(ticker, current_price, signal):
 
 
 def run_option_hunter(vix):
-    """
-    Full option hunter scan across 55 tickers.
-    Returns top 10 opportunities sorted by signal strength.
-    """
     logger.info(f"🎯 Option Hunter scanning {len(OPTION_HUNT_TICKERS)} tickers...")
     results = []
-
     for ticker in OPTION_HUNT_TICKERS:
         try:
-            logger.info(f"   Scanning {ticker}...")
             data = get_stock_data(ticker)
             if not data:
                 continue
-
-            # --- Price validation gate ---
-            valid, yf_price, diff_pct = validate_price(ticker, data["current_price"])
-            if not valid:
-                logger.warning(
-                    f"   ⚠️ {ticker} BLOCKED — Polygon ${data['current_price']:.2f} "
-                    f"vs yfinance ${yf_price:.2f} ({diff_pct:.2f}% diff)"
-                )
-                continue
-
-            # --- Score the ticker ---
             scored = score_ticker(data)
             if not scored:
                 continue
-
             signal = classify_signal(scored["score"])
             if not signal:
-                continue  # No clear signal, skip
-
-            # --- VIX gate ---
+                continue
             if vix:
-                if signal in ("STRONG_BUY", "MEDIUM_BUY") and vix["level"] > 30:
-                    continue  # Too fearful for calls
-                if signal in ("STRONG_SELL", "WEAK_SELL") and vix["level"] < 15:
-                    continue  # Too calm for puts
-
-            # --- Options chain ---
+                if signal in ("STRONG_BUY","MEDIUM_BUY") and vix["level"] > 30:
+                    continue
+                if signal in ("STRONG_SELL","WEAK_SELL") and vix["level"] < 15:
+                    continue
             option = get_best_option(ticker, data["current_price"], signal)
             if not option:
                 continue
-
             results.append({
-                "ticker":    ticker,
-                "price":     data["current_price"],
-                "score":     scored["score"],
-                "signal":    signal,
-                "details":   scored["details"],
-                "option":    option,
-                "yf_price":  yf_price,
-                "diff_pct":  diff_pct,
+                "ticker": ticker, "price": data["current_price"],
+                "score": scored["score"], "signal": signal,
+                "details": scored["details"], "option": option,
             })
-
-            time.sleep(0.5)  # Respectful pacing between tickers
-
+            time.sleep(0.5)
         except Exception as e:
-            logger.error(f"   Option Hunter {ticker}: {e}")
-            continue
-
+            logger.error(f"Option Hunter {ticker}: {e}")
     results.sort(key=lambda x: abs(x["score"]), reverse=True)
     logger.info(f"🎯 Option Hunter found {len(results)} setup(s)")
     return results[:10]
 
 
 # ============================================================================
-# PORTFOLIO & MARKET DATA
+# SWING TRADE ENGINE (preserved from v2.0)
 # ============================================================================
 
-def get_portfolio_data():
-    total_cost = total_value = 0
-    positions  = {}
+def _is_near_earnings(ticker):
+    today    = datetime.now(EST).date()
+    date_str = EARNINGS_CALENDAR.get(ticker)
+    if not date_str:
+        return False
+    earn_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+    return 0 <= (earn_date - today).days <= 2
 
-    for ticker, info in live_portfolio.items():
-        data = get_stock_data(ticker)
-        if not data:
+def _get_top_movers():
+    movers = []
+    candidates = [
+        "NVDA","AMD","TSLA","AAPL","META","AMZN","MSFT","GOOGL",
+        "ARM","MRVL","AVGO","PLTR","CRWD","PANW","SHOP","SOFI",
+        "HIMS","CRWV","NBIS","RKLB","ALAB","IREN","APLD","COIN",
+    ]
+    for ticker in candidates:
+        try:
+            info  = yf.Ticker(ticker).fast_info
+            price = getattr(info, "last_price", None)
+            prev  = getattr(info, "previous_close", None)
+            if price and prev and float(prev) > 0:
+                pct = (float(price) - float(prev)) / float(prev) * 100
+                if abs(pct) >= 3.0:
+                    movers.append(ticker)
+        except:
             continue
-        price     = data["current_price"]
-        cost      = info["shares"] * info["avg_cost"]
-        value     = info["shares"] * price
-        pnl       = value - cost
-        pnl_pct   = (pnl / cost * 100) if cost > 0 else 0
-        total_cost  += cost
-        total_value += value
-        positions[ticker] = {"price": price, "pnl": pnl, "pnl_pct": pnl_pct}
+    return movers
 
-    return {
-        "positions":    positions,
-        "total_value":  total_value,
-        "total_pnl":    total_value - total_cost,
-        "total_pnl_pct":((total_value - total_cost) / total_cost * 100) if total_cost else 0,
-    }
+def run_swing_scanner(vix):
+    logger.info("📊 Swing Trade Scanner running...")
+    vix_level    = vix["level"] if vix else 20
+    risk_tier    = "low" if vix_level < 20 else ("medium" if vix_level < 25 else "high")
+    risk_pct     = SWING_RISK[risk_tier]
+    swing_capital = user_settings.get("swing_capital", 2000)
+    risk_dollars = swing_capital * risk_pct
 
+    stock_tickers = get_stock_tickers_from_portfolio()
+    universe = list(set(stock_tickers + OPTION_HUNT_TICKERS + _get_top_movers()))
+    results  = []
 
-def get_market_metrics():
-    metrics = {}
-    for ticker in MARKET_TICKERS:
-        data = get_stock_data(ticker)
-        if data:
-            metrics[ticker] = {
-                "current":   data["current_price"],
-                "daily_pct": data["daily_change_pct"],
-            }
-    return metrics or None
+    for ticker in universe:
+        try:
+            data = get_stock_data(ticker)
+            if not data or data["current_price"] < SWING_MIN_PRICE:
+                continue
+            if _is_near_earnings(ticker):
+                continue
+
+            scored = score_ticker(data)
+            if not scored or scored["score"] < BUY_MEDIUM:
+                continue
+
+            rsi = scored.get("rsi")
+            if rsi and (rsi > 68 or rsi < 35):
+                continue
+
+            vols = data["volumes"]
+            if len(vols) < 20:
+                continue
+            avg_vol   = np.mean(vols[-20:])
+            vol_ratio = vols[-1] / avg_vol if avg_vol > 0 else 1
+            if vol_ratio < 1.3:
+                continue
+
+            atr = _atr(data["highs"], data["lows"], data["closes"])
+            if not atr:
+                continue
+
+            entry          = data["current_price"]
+            stop           = round(entry - (1.5 * atr), 2)
+            risk_per_share = entry - stop
+            if risk_per_share <= 0:
+                continue
+
+            shares      = max(1, int(risk_dollars / risk_per_share))
+            max_shares  = int((swing_capital * 0.75) / entry)
+            shares      = min(shares, max_shares)
+            pos_value   = round(shares * entry, 2)
+            dollar_risk = round(shares * risk_per_share, 2)
+
+            t1_price  = round(entry * (1 + SWING_TARGET1_PCT), 2)
+            t2_price  = round(entry * (1 + SWING_TARGET2_PCT), 2)
+            t1_profit = round(shares * 0.5 * (t1_price - entry), 2)
+            t2_profit = round(shares * 0.5 * (t2_price - entry), 2)
+            total_profit = round(t1_profit + t2_profit, 2)
+            rr = round(total_profit / dollar_risk, 2) if dollar_risk > 0 else 0
+            if rr < SWING_MIN_RR:
+                continue
+
+            results.append({
+                "ticker": ticker, "score": scored["score"],
+                "entry": entry, "stop": stop,
+                "t1_price": t1_price, "t2_price": t2_price,
+                "t1_profit": t1_profit, "t2_profit": t2_profit,
+                "total_profit": total_profit, "shares": shares,
+                "position_value": pos_value, "dollar_risk": dollar_risk,
+                "rr": rr, "rsi": round(rsi, 1) if rsi else "N/A",
+                "vol_ratio": round(vol_ratio, 1), "atr": round(atr, 2),
+                "cancel_below": round(entry * 0.99, 2),
+                "risk_tier": risk_tier, "details": scored["details"],
+            })
+            time.sleep(0.3)
+        except Exception as e:
+            logger.warning(f"Swing scan {ticker}: {e}")
+
+    results.sort(key=lambda x: (x["score"], x["rr"]), reverse=True)
+    logger.info(f"📊 Swing scanner found {len(results)} setup(s)")
+    return results[:3]
 
 
 # ============================================================================
@@ -1005,7 +1326,7 @@ def _time_display():
     }
 
 
-def format_market_report(portfolio, market, vix):
+def format_market_report(pnl_data, market, vix):
     try:
         t   = _time_display()
         msg = "🕐 *MARKET SNAPSHOT*\n"
@@ -1019,108 +1340,153 @@ def format_market_report(portfolio, market, vix):
             for tk, d in market.items():
                 e = "🟢" if d["daily_pct"] >= 0 else "🔴"
                 msg += f"{e} {tk}: ${d['current']:.2f} ({d['daily_pct']:+.2f}%)\n"
-        else:
-            msg += "_(unavailable)_\n"
 
-        msg += "\n"
-
-        if portfolio.get("positions"):
-            msg += "💼 *PORTFOLIO*\n"
-            for tk, pos in portfolio["positions"].items():
+        msg += "\n💼 *PORTFOLIO*\n"
+        positions = pnl_data.get("positions", {})
+        if positions:
+            for key, pos in positions.items():
                 e = "🟢" if pos["pnl_pct"] >= 0 else "🔴"
-                msg += f"{e} {tk}: ${pos['price']:.2f} | {pos['pnl_pct']:+.1f}% (${pos['pnl']:+.0f})\n"
-            msg += "\n" + "=" * 35 + "\n"
-            e = "🟢" if portfolio["total_pnl_pct"] >= 0 else "🔴"
-            msg += f"{e} *TOTAL P&L: ${portfolio['total_pnl']:+.0f} ({portfolio['total_pnl_pct']:+.1f}%)*\n"
-        else:
-            msg += "_Portfolio data unavailable_\n"
+                if pos["asset_type"] == "stock":
+                    msg += f"{e} {pos['ticker']}: ${pos['price']:.2f} | {pos['pnl_pct']:+.1f}% (${pos['pnl']:+.0f})\n"
+                else:
+                    strike_label = f"${pos['strike']:.0f}" if pos.get("strike") else ""
+                    etype = pos["asset_type"].upper()
+                    msg += f"{e} {pos['ticker']} {strike_label} {etype}: {pos['pnl_pct']:+.1f}% (${pos['pnl']:+.0f}) [{pos.get('status','')}]\n"
 
+            msg += "\n" + "=" * 30 + "\n"
+            e = "🟢" if pnl_data["total_pnl_pct"] >= 0 else "🔴"
+            daily_e = "🟢" if pnl_data["daily_pnl"] >= 0 else "🔴"
+            msg += f"{e} *TOTAL P&L: ${pnl_data['total_pnl']:+.0f} ({pnl_data['total_pnl_pct']:+.1f}%)*\n"
+            msg += f"{daily_e} *Today: ${pnl_data['daily_pnl']:+.0f}*\n"
         return msg
     except Exception as e:
         logger.error(f"format_market_report: {e}")
         return "❌ Market report error"
 
 
-def format_trading_signals(vix):
+def format_eod_summary(pnl_data, market, vix):
+    """End-of-day summary: total value, daily P&L, top gainers/losers."""
     try:
         t   = _time_display()
-        msg = "📈 *TRADING SIGNALS — YOUR PORTFOLIO*\n"
+        msg = "🔔 *END OF DAY SUMMARY*\n"
         msg += f"_{t['sgt']} | {t['est']}_\n\n"
 
         if vix:
-            msg += f"{vix['emoji']} *VIX: {vix['level']:.2f}* — {vix['sentiment']}\n\n"
+            msg += f"{vix['emoji']} VIX: {vix['level']:.2f} — {vix['sentiment']}\n\n"
 
-        buys, sells, holds = [], [], []
+        if market:
+            msg += "📊 *Market Close:*\n"
+            for tk, d in market.items():
+                e = "🟢" if d["daily_pct"] >= 0 else "🔴"
+                msg += f"{e} {tk}: {d['daily_pct']:+.2f}%\n"
+            msg += "\n"
 
-        for ticker in live_portfolio:
-            data = get_stock_data(ticker)
-            if not data:
-                continue
-            scored = score_ticker(data)
-            if not scored:
-                continue
-            score  = scored["score"]
-            signal = classify_signal(score)
-            info   = live_portfolio[ticker]
-            price  = data["current_price"]
-            pnl_pct = ((price - info["avg_cost"]) / info["avg_cost"] * 100)
+        positions = pnl_data.get("positions", {})
+        stock_pos = {k: v for k, v in positions.items() if v["asset_type"] == "stock"}
+        opt_pos   = {k: v for k, v in positions.items() if v["asset_type"] in ("call","put")}
 
-            if signal in ("STRONG_BUY", "MEDIUM_BUY"):
-                buys.append((ticker, data, scored, signal, pnl_pct))
-            elif signal in ("STRONG_SELL", "WEAK_SELL"):
-                sells.append((ticker, data, scored, signal, pnl_pct))
-            else:
-                holds.append((ticker, price, score, pnl_pct))
+        # Portfolio totals
+        daily_e   = "🟢" if pnl_data["daily_pnl"] >= 0 else "🔴"
+        total_e   = "🟢" if pnl_data["total_pnl"] >= 0 else "🔴"
+        msg += f"💼 *Portfolio Value: ${pnl_data['total_value']:,.0f}*\n"
+        msg += f"{daily_e} Day P&L: ${pnl_data['daily_pnl']:+.0f}\n"
+        msg += f"{total_e} Total P&L: ${pnl_data['total_pnl']:+.0f} ({pnl_data['total_pnl_pct']:+.1f}%)\n\n"
 
-        # --- BUY / ADD block ---
-        if buys:
-            msg += "🟢 *ADD TO POSITION*\n"
-            msg += "_(These holdings show fresh buy signals — consider adding more)_\n\n"
-            for ticker, data, scored, signal, pnl_pct in buys:
-                price = data["current_price"]
-                entry = scored["bb"]["lower"] if scored.get("bb") else price * 0.98
-                stop  = entry * (1 - STOP_LOSS_PCT)
-                label = "🟢🟢 STRONG ADD" if signal == "STRONG_BUY" else "🟢 MEDIUM ADD"
-                msg += f"{label}: *{ticker}* @ ${price:.2f} | Score: {scored['score']:+d}/6\n"
-                msg += f"Your P&L: {pnl_pct:+.1f}% | Entry: ${entry:.2f} | Stop: ${stop:.2f}\n"
-                for d in scored["details"][:3]:
-                    msg += f"  {d}\n"
-                msg += "\n"
-        else:
-            msg += "🟢 *ADD SIGNALS:* None right now\n\n"
+        # Top gainers (stocks, by daily P&L)
+        sorted_pos = sorted(stock_pos.values(), key=lambda x: x["daily_pnl"], reverse=True)
+        if sorted_pos:
+            msg += "🏆 *Top Gainers Today:*\n"
+            for p in sorted_pos[:3]:
+                if p["daily_pnl"] <= 0:
+                    break
+                msg += f"🟢 {p['ticker']}: +${p['daily_pnl']:.0f} ({((p['price']-p['prev_close'] if 'prev_close' in p else 0)/p.get('prev_close',p['price'])*100) if p.get('prev_close') else 0:+.1f}%)\n"
+            msg += "\n"
 
-        msg += "=" * 35 + "\n\n"
+            msg += "📉 *Top Losers Today:*\n"
+            for p in reversed(sorted_pos[-3:]):
+                if p["daily_pnl"] >= 0:
+                    break
+                msg += f"🔴 {p['ticker']}: ${p['daily_pnl']:.0f}\n"
+            msg += "\n"
 
-        # --- SELL / TRIM block ---
-        if sells:
-            msg += "🔴 *CONSIDER TRIMMING*\n"
-            msg += "_(Overbought signals — not panic sell, just take partial profits)_\n\n"
-            for ticker, data, scored, signal, pnl_pct in sells:
-                price = data["current_price"]
-                exit_ = scored["bb"]["upper"] if scored.get("bb") else price * 1.02
-                label = "🔴🔴 STRONGLY TRIM" if signal == "STRONG_SELL" else "🔴 TRIM SOME"
-                msg += f"{label}: *{ticker}* @ ${price:.2f} | Score: {scored['score']:+d}/6\n"
-                msg += f"Your P&L: {pnl_pct:+.1f}% | Trim target: ${exit_:.2f}\n"
-                msg += f"💡 Suggestion: Sell 30-50% to lock in gains, hold the rest\n"
-                for d in scored["details"][:3]:
-                    msg += f"  {d}\n"
-                msg += "\n"
-        else:
-            msg += "🔴 *TRIM SIGNALS:* None right now\n\n"
+        # Options snapshot
+        if opt_pos:
+            msg += "🎯 *Options P&L:*\n"
+            for p in opt_pos.values():
+                e = "🟢" if p["pnl"] >= 0 else "🔴"
+                msg += f"{e} {p['ticker']} ${p.get('strike',0):.0f} {p['asset_type'].upper()} [{p.get('status','')}]: ${p['pnl']:+.0f} ({p['pnl_pct']:+.1f}%)\n"
+            msg += "\n"
 
-        msg += "=" * 35 + "\n\n"
-
-        # --- HOLD block (brief summary) ---
-        if holds:
-            msg += "⏸️ *HOLD — No action needed:*\n"
-            for ticker, price, score, pnl_pct in holds:
-                emoji = "🟢" if pnl_pct >= 0 else "🔴"
-                msg += f"{emoji} {ticker}: ${price:.2f} | Score: {score:+d}/6 | P&L: {pnl_pct:+.1f}%\n"
-
+        msg += "_/portfolio for live detail | /scan for tomorrow's setups_"
         return msg
     except Exception as e:
-        logger.error(f"format_trading_signals: {e}")
-        return "❌ Signals error"
+        logger.error(f"format_eod_summary: {e}")
+        return "❌ EOD summary error"
+
+
+def format_portfolio_signals(protection, growth, watchlist, vix):
+    """Format all 3 signal types into a combined Telegram message."""
+    try:
+        t   = _time_display()
+        msg = f"📡 *SIGNAL SCAN*\n_{t['sgt']} | {t['est']}_\n\n"
+
+        if vix:
+            msg += f"{vix['emoji']} VIX: {vix['level']:.2f} — {vix['sentiment']}\n\n"
+
+        if protection:
+            msg += f"🛡️ *PORTFOLIO PROTECTION ({len(protection)} alert(s))*\n\n"
+            for s in protection:
+                msg += _format_signal_alert(
+                    s["signal_type"], s["ticker"], s["price"], s["score"],
+                    s["confidence"], s["what"], s["why"], s["strategy"], s["action"],
+                    s["details"], earn_warning=s.get("earn_warning"),
+                ) + "\n\n"
+        else:
+            msg += "🛡️ *PORTFOLIO PROTECTION:* No alerts this cycle\n\n"
+
+        if growth:
+            msg += f"🚀 *PORTFOLIO GROWTH ({len(growth)} signal(s))*\n\n"
+            for s in growth:
+                msg += _format_signal_alert(
+                    s["signal_type"], s["ticker"], s["price"], s["score"],
+                    s["confidence"], s["what"], s["why"], s["strategy"], s["action"],
+                    s["details"],
+                ) + "\n\n"
+        else:
+            msg += "🚀 *PORTFOLIO GROWTH:* No add signals this cycle\n\n"
+
+        if watchlist:
+            msg += f"🔍 *WATCHLIST OPPORTUNITIES ({len(watchlist)} found)*\n\n"
+            for s in watchlist:
+                msg += _format_signal_alert(
+                    s["signal_type"], s["ticker"], s["price"], s["score"],
+                    s["confidence"], s["what"], s["why"], s["strategy"], s["action"],
+                    s["details"], catalyst=s.get("catalyst"), earn_warning=s.get("earn_warning"),
+                ) + "\n\n"
+        else:
+            msg += "🔍 *WATCHLIST:* No high-confidence opportunities (score ≥5 required)\n\n"
+
+        msg += "_Confidence ≥60% required | Same ticker cooldown: 60min | Watchlist cap: 3/cycle_"
+        return msg
+    except Exception as e:
+        logger.error(f"format_portfolio_signals: {e}")
+        return "❌ Signal format error"
+
+
+def format_earnings_alerts(alerts):
+    if not alerts:
+        return None
+    t   = _time_display()
+    msg = "📅 *EARNINGS ALERT — OPTIONS WATCH*\n"
+    msg += f"_{t['sgt']} | {t['est']}_\n\n"
+    for a in alerts:
+        day_label = "TODAY after close" if a["days_away"] == 0 else ("TOMORROW" if a["days_away"] == 1 else "In 2 days")
+        msg += f"{a['bias']}: *{a['ticker']}*\n"
+        msg += f"Earnings: {a['earn_date']} ({day_label})\n"
+        msg += f"Tech score: {a['score']:+d}/6 | {a['reason']}\n"
+        msg += f"⚠️ IV spikes at open — buy options BEFORE report\n\n"
+    msg += "_Earnings = binary risk. Max 1% capital per trade._"
+    return msg
 
 
 def format_option_hunter(opportunities, vix):
@@ -1128,305 +1494,129 @@ def format_option_hunter(opportunities, vix):
         t   = _time_display()
         msg = "🎯 *OPTION HUNTER*\n"
         msg += f"_{t['sgt']} | {t['est']}_\n\n"
-
         if vix:
             iv_note = "✅ Low IV — cheap premiums" if vix["call_friendly"] else "⚠️ Elevated IV — expensive premiums"
             msg += f"{vix['emoji']} *VIX: {vix['level']:.2f}* — {iv_note}\n\n"
-
         if not opportunities:
-            msg += "🔍 *No qualifying setups this scan.*\n"
-            msg += "_Criteria: Score ≥4/6 | OI >500 | DTE 21–35 | IV <50%_\n"
+            msg += "🔍 *No qualifying setups this scan.*\n_Criteria: Score ≥4/6 | OI >500 | DTE 21–35 | IV <50%_\n"
             return msg
 
-        msg += f"*{len(opportunities)} setup(s) found:*\n\n"
-
         labels = {
-            "STRONG_BUY":  "🟢🟢 STRONG CALL",
-            "MEDIUM_BUY":  "🟢 MEDIUM CALL",
-            "STRONG_SELL": "🔴🔴 STRONG PUT",
-            "WEAK_SELL":   "🔴 MEDIUM PUT",
+            "STRONG_BUY": "🟢🟢 STRONG CALL", "MEDIUM_BUY": "🟢 MEDIUM CALL",
+            "STRONG_SELL": "🔴🔴 STRONG PUT", "WEAK_SELL": "🔴 MEDIUM PUT",
         }
-
         for opp in opportunities:
-            opt   = opp["option"]
+            opt = opp["option"]
             label = labels.get(opp["signal"], opt["direction"])
-            max_risk   = round(opt["mid"] * 100, 2)
-            target_pnl = round(opt["mid"] * 100, 2)  # 2x target = entry × 2 × 100
-
-            # Price validation note
-            if opp.get("yf_price"):
-                val = f"✅ Price validated: Polygon ${opp['price']:.2f} vs yfinance ${opp['yf_price']:.2f} ({opp['diff_pct']:.2f}% diff)"
-            else:
-                val = "⚠️ Single source (yfinance unavailable for cross-check)"
-
+            max_risk = round(opt["mid"] * 100, 2)
             msg += f"{label}: *{opp['ticker']}*\n"
-            msg += f"Stock: ${opp['price']:.2f} | Signal score: {opp['score']:+d}/6\n"
-            msg += f"Entry trigger: Only buy if stock ≤ ${opp['price']*1.005:.2f} (within 0.5% of now)\n"
+            msg += f"Stock: ${opp['price']:.2f} | Score: {opp['score']:+d}/6\n"
             msg += f"Contract: ${opt['strike']:.0f} {opt['direction']} | Exp: {opt['expiry']} ({opt['dte']} DTE)\n"
-            msg += f"Premium: ~${opt['mid']:.2f}/contract | Max risk: ${max_risk:.0f}\n"
-            msg += f"Target: ${opt['mid']*2:.2f} (2× = +${target_pnl:.0f}) | OI: {opt['oi']:,} | IV: {opt['iv']:.0f}%\n"
-            msg += "Top signals:\n"
-            for d in opp["details"][:4]:
+            msg += f"Premium: ~${opt['mid']:.2f} | Max risk: ${max_risk:.0f} | OI: {opt['oi']:,} | IV: {opt['iv']:.0f}%\n"
+            msg += f"Target: ${opt['mid']*2:.2f} (2×) | Entry trigger: ≤${opp['price']*1.005:.2f}\n"
+            for d in opp["details"][:3]:
                 msg += f"  {d}\n"
             msg += "\n"
-
-        msg += "⚠️ _1 contract = 100 shares. Never risk >2% of capital per trade. Options can expire worthless._"
+        msg += "⚠️ _1 contract = 100 shares. Never risk >2% capital per trade._"
         return msg
     except Exception as e:
-        logger.error(f"format_option_hunter: {e}")
-        return "❌ Option Hunter error"
-
-
-# ============================================================================
-# SWING TRADE ENGINE
-# ============================================================================
-
-def _atr(highs, lows, closes, period=14):
-    """Average True Range — measures stock's natural volatility for stop sizing."""
-    try:
-        h = np.array(highs[-period-1:], dtype=float)
-        l = np.array(lows[-period-1:],  dtype=float)
-        c = np.array(closes[-period-1:], dtype=float)
-        trs = []
-        for i in range(1, len(c)):
-            trs.append(max(h[i]-l[i], abs(h[i]-c[i-1]), abs(l[i]-c[i-1])))
-        return np.mean(trs) if trs else None
-    except:
-        return None
-
-
-def _is_near_earnings(ticker):
-    """Returns True if stock has earnings within 2 days — skip swing trades."""
-    today = datetime.now(EST).date()
-    date_str = EARNINGS_CALENDAR.get(ticker)
-    if not date_str:
-        return False
-    earn_date = datetime.strptime(date_str, "%Y-%m-%d").date()
-    return 0 <= (earn_date - today).days <= 2
-
-
-def _get_top_movers():
-    """Fetch today's top % gainers from yfinance screener proxy."""
-    movers = []
-    try:
-        # Use a broad ETF holdings proxy — scan high-volume liquid names
-        candidates = [
-            "NVDA","AMD","TSLA","AAPL","META","AMZN","MSFT","GOOGL",
-            "ARM","MRVL","AVGO","PLTR","CRWD","PANW","SHOP","SOFI",
-            "HIMS","CRWV","NBIS","RKLB","ALAB","IREN","APLD","COIN",
-        ]
-        for ticker in candidates:
-            try:
-                info  = yf.Ticker(ticker).fast_info
-                price = getattr(info, "last_price", None)
-                prev  = getattr(info, "previous_close", None)
-                if price and prev and float(prev) > 0:
-                    pct = (float(price) - float(prev)) / float(prev) * 100
-                    if abs(pct) >= 3.0:  # Moving 3%+ today
-                        movers.append(ticker)
-            except:
-                continue
-    except Exception as e:
-        logger.warning(f"Top movers scan: {e}")
-    return movers
-
-
-def run_swing_scanner(vix):
-    """
-    Scans all 3 universes for swing trade setups.
-    Returns top 3 setups sorted by score and R/R ratio.
-    """
-    logger.info("📊 Swing Trade Scanner running...")
-
-    # Determine VIX risk tier
-    vix_level = vix["level"] if vix else 20
-    if vix_level < 20:
-        risk_tier, risk_pct = "low", SWING_RISK["low"]
-    elif vix_level < 25:
-        risk_tier, risk_pct = "medium", SWING_RISK["medium"]
-    else:
-        risk_tier, risk_pct = "high", SWING_RISK["high"]
-
-    risk_dollars = SWING_CAPITAL * risk_pct  # e.g. $60 at risk per trade
-
-    # Build combined universe
-    universe = list(set(
-        list(HOLDINGS.keys()) +
-        OPTION_HUNT_TICKERS +
-        _get_top_movers()
-    ))
-
-    results = []
-
-    for ticker in universe:
-        try:
-            # Skip penny stocks and earnings risk
-            data = get_stock_data(ticker)
-            if not data:
-                continue
-            if data["current_price"] < SWING_MIN_PRICE:
-                continue
-            if _is_near_earnings(ticker):
-                logger.info(f"   {ticker} skipped — earnings within 2 days")
-                continue
-
-            # Score with 6-indicator system
-            scored = score_ticker(data)
-            if not scored:
-                continue
-
-            score = scored["score"]
-
-            # Only take strong/medium BUY swings (long only on cash account)
-            if score < BUY_MEDIUM:
-                continue
-
-            # RSI check — avoid overbought entries (RSI 40-68 sweet spot)
-            rsi = scored.get("rsi")
-            if rsi and (rsi > 68 or rsi < 35):
-                continue
-
-            # Volume check — must have conviction
-            vols = data["volumes"]
-            if len(vols) >= 20:
-                avg_vol    = np.mean(vols[-20:])
-                vol_ratio  = vols[-1] / avg_vol if avg_vol > 0 else 1
-                if vol_ratio < 1.3:
-                    continue  # Low volume = weak conviction
-
-            # ATR-based stop loss (1.5× ATR below entry)
-            atr = _atr(data["highs"], data["lows"], data["closes"])
-            if not atr:
-                continue
-
-            entry      = data["current_price"]
-            stop       = round(entry - (1.5 * atr), 2)
-            risk_per_share = entry - stop
-
-            if risk_per_share <= 0:
-                continue
-
-            # Position sizing — shares based on dollar risk
-            shares = max(1, int(risk_dollars / risk_per_share))
-
-            # Cap shares so total position ≤ 75% of swing capital
-            max_shares = int((SWING_CAPITAL * 0.75) / entry)
-            shares     = min(shares, max_shares)
-
-            position_value = round(shares * entry, 2)
-            dollar_risk    = round(shares * risk_per_share, 2)
-
-            # Profit targets
-            t1_price  = round(entry * (1 + SWING_TARGET1_PCT), 2)
-            t2_price  = round(entry * (1 + SWING_TARGET2_PCT), 2)
-            t1_profit = round(shares * 0.5 * (t1_price - entry), 2)
-            t2_profit = round(shares * 0.5 * (t2_price - entry), 2)
-            total_profit = round(t1_profit + t2_profit, 2)
-
-            # Risk/Reward check
-            rr = round(total_profit / dollar_risk, 2) if dollar_risk > 0 else 0
-            if rr < SWING_MIN_RR:
-                continue
-
-            # Cancel trigger — if opens below this, skip the trade
-            cancel_below = round(entry * 0.99, 2)
-
-            results.append({
-                "ticker":         ticker,
-                "score":          score,
-                "entry":          entry,
-                "stop":           stop,
-                "t1_price":       t1_price,
-                "t2_price":       t2_price,
-                "t1_profit":      t1_profit,
-                "t2_profit":      t2_profit,
-                "total_profit":   total_profit,
-                "shares":         shares,
-                "position_value": position_value,
-                "dollar_risk":    dollar_risk,
-                "rr":             rr,
-                "rsi":            round(rsi, 1) if rsi else "N/A",
-                "vol_ratio":      round(vol_ratio, 1),
-                "atr":            round(atr, 2),
-                "cancel_below":   cancel_below,
-                "risk_tier":      risk_tier,
-                "details":        scored["details"],
-            })
-
-            time.sleep(0.3)
-
-        except Exception as e:
-            logger.warning(f"Swing scan {ticker}: {e}")
-            continue
-
-    # Sort by score then R/R, return top 3
-    results.sort(key=lambda x: (x["score"], x["rr"]), reverse=True)
-    logger.info(f"📊 Swing scanner found {len(results)} setup(s)")
-    return results[:3]
+        return f"❌ Option Hunter error: {e}"
 
 
 def format_swing_trades(setups, vix):
-    """Format swing trade Telegram message."""
     try:
         t   = _time_display()
         msg = "📊 *SWING TRADE SETUPS*\n"
         msg += f"_{t['sgt']} | {t['est']}_\n\n"
-
-        vix_level = vix["level"] if vix else 20
+        vix_level    = vix["level"] if vix else 20
+        swing_capital = user_settings.get("swing_capital", 2000)
         if vix:
             msg += f"{vix['emoji']} *VIX: {vix_level:.1f}* — {vix['sentiment']}\n"
-
-        # Capital summary
-        risk_pct   = SWING_RISK["low"] if vix_level < 20 else (
-                     SWING_RISK["medium"] if vix_level < 25 else SWING_RISK["high"])
-        risk_dollars = SWING_CAPITAL * risk_pct
-        msg += f"💰 Capital: ${SWING_CAPITAL:,} | Risk/trade: ${risk_dollars:.0f} "
-        msg += f"({risk_pct*100:.0f}% — VIX calibrated)\n"
-        msg += f"🎯 Daily target: ${SWING_CAPITAL*0.03:.0f}–${SWING_CAPITAL*0.075:.0f} "
-        msg += f"| Max trades: {SWING_MAX_TRADES}\n\n"
-
+        risk_pct     = SWING_RISK["low"] if vix_level < 20 else (SWING_RISK["medium"] if vix_level < 25 else SWING_RISK["high"])
+        risk_dollars = swing_capital * risk_pct
+        msg += f"💰 Capital: ${swing_capital:,} | Risk/trade: ${risk_dollars:.0f} ({risk_pct*100:.0f}% VIX-calibrated)\n\n"
         if not setups:
             msg += "🔍 *No qualifying swing setups this scan.*\n"
-            msg += "_Criteria: Score ≥4/6 | RSI 35-68 | Volume >1.3× | R/R ≥1:2_\n"
             return msg
-
-        signal_labels = {5: "🟢🟢 STRONG SWING", 4: "🟢 MEDIUM SWING"}
-
-        for i, s in enumerate(setups, 1):
-            label = signal_labels.get(s["score"], "🟢 SWING")
-            msg += f"{'━'*35}\n"
-            msg += f"{label}: *{s['ticker']}*\n"
-            msg += f"Score: {s['score']:+d}/6 | RSI: {s['rsi']} | Vol: {s['vol_ratio']}× avg\n\n"
-
-            msg += f"*Entry:*  ${s['entry']:.2f} _(limit order)_\n"
-            msg += f"*Shares:* {s['shares']} shares = ${s['position_value']:,.0f}\n"
-            msg += f"*Stop:*   ${s['stop']:.2f} (1.5× ATR = -${s['dollar_risk']:.0f} max loss)\n\n"
-
-            msg += f"*🎯 Target 1:* ${s['t1_price']:.2f} (+5%) → sell 50% = +${s['t1_profit']:.0f}\n"
-            msg += f"*🎯 Target 2:* ${s['t2_price']:.2f} (+10%) → sell 50% = +${s['t2_profit']:.0f}\n"
-            msg += f"*Total if both hit:* +${s['total_profit']:.0f}\n"
-            msg += f"*R/R Ratio:* 1:{s['rr']} ✅\n\n"
-
-            msg += f"⏱ Hold max *{SWING_HOLD_DAYS} days* — exit regardless\n"
-            msg += f"❌ *Cancel if opens below ${s['cancel_below']:.2f}*\n\n"
-
-            msg += f"Why now:\n"
-            for d in s["details"][:4]:
+        for s in setups:
+            label = "🟢🟢 STRONG SWING" if s["score"] >= BUY_STRONG else "🟢 MEDIUM SWING"
+            msg += f"{'━'*32}\n{label}: *{s['ticker']}*\n"
+            msg += f"Score: {s['score']:+d}/6 | RSI: {s['rsi']} | Vol: {s['vol_ratio']}×\n\n"
+            msg += f"*Entry:* ${s['entry']:.2f} | *Stop:* ${s['stop']:.2f} | *Shares:* {s['shares']}\n"
+            msg += f"*T1:* ${s['t1_price']:.2f} (+5%) → +${s['t1_profit']:.0f}\n"
+            msg += f"*T2:* ${s['t2_price']:.2f} (+10%) → +${s['t2_profit']:.0f}\n"
+            msg += f"*R/R:* 1:{s['rr']} | Hold max {SWING_HOLD_DAYS}d\n"
+            msg += f"❌ Cancel below ${s['cancel_below']:.2f}\n"
+            for d in s["details"][:3]:
                 msg += f"  {d}\n"
             msg += "\n"
-
-        msg += "━" * 35 + "\n"
-        msg += f"⚠️ _Max {SWING_MAX_TRADES} trades open at once. "
-        msg += f"Never risk >3% capital per trade. Exit at T1 if no movement by EOD2._"
+        msg += f"⚠️ _Max {SWING_MAX_TRADES} trades at once. Stop loss mandatory._"
         return msg
-
     except Exception as e:
-        logger.error(f"format_swing_trades: {e}")
-        return "❌ Swing trade error"
+        return f"❌ Swing trade error: {e}"
+
+
+def format_reminders_section():
+    if not reminders:
+        return None
+    today = datetime.now(EST).date()
+    t     = _time_display()
+    lines = []
+    to_remove = []
+    for r in reminders:
+        ticker = r["ticker"]
+        action = r["action"]
+        note   = r.get("note", "")
+        emoji  = "🟢" if action == "BUY" else ("🔴" if action == "SELL" else "⏸️")
+        if r.get("remind_date"):
+            try:
+                remind_dt = datetime.strptime(r["remind_date"], "%Y-%m-%d").date()
+                days_left = (remind_dt - today).days
+                if days_left < 0:
+                    to_remove.append(r); continue
+                elif days_left == 0:
+                    lines.append(f"🔔 *TODAY* — {emoji} {action} *{ticker}*\n   {note}")
+                    to_remove.append(r)
+                elif days_left <= 3:
+                    lines.append(f"⏰ *In {days_left} day(s)* — {emoji} {action} *{ticker}*\n   {note}")
+                else:
+                    lines.append(f"📅 *{r['remind_date']}* — {emoji} {action} *{ticker}*\n   {note}")
+            except:
+                continue
+        elif r.get("target_price"):
+            try:
+                target  = float(r["target_price"])
+                data    = get_stock_data(ticker)
+                current = data["current_price"] if data else None
+                if current:
+                    diff_pct = ((current - target) / target * 100)
+                    if action == "BUY" and current <= target * 1.005:
+                        lines.append(f"🔔 *PRICE HIT!* 🟢 BUY *{ticker}* @ ${current:.2f} (target ${target:.2f})\n   {note}")
+                        to_remove.append(r)
+                    elif action == "SELL" and current >= target * 0.995:
+                        lines.append(f"🔔 *PRICE HIT!* 🔴 SELL *{ticker}* @ ${current:.2f} (target ${target:.2f})\n   {note}")
+                        to_remove.append(r)
+                    else:
+                        arrow = "📈" if action == "BUY" else "📉"
+                        lines.append(f"{arrow} {emoji} {action} *{ticker}* when ${target:.2f} | Now ${current:.2f} ({diff_pct:+.1f}% away)\n   {note}")
+            except:
+                continue
+    for r in to_remove:
+        if r in reminders:
+            reminders.remove(r)
+    if to_remove:
+        save_reminders(reminders)
+    if not lines:
+        return None
+    msg  = "🔔 *REMINDERS*\n"
+    msg += f"_{t['sgt']} | {t['est']}_\n\n"
+    msg += "\n".join(lines)
+    msg += "\n\n_/reminders to manage | /remind TICKER to add_"
+    return msg
 
 
 # ============================================================================
-# TELEGRAM SENDER (with chunking for long messages)
+# TELEGRAM SENDER
 # ============================================================================
 
 async def _send(message):
@@ -1438,9 +1628,7 @@ async def _send(message):
             await bot.send_message(chat_id=TELEGRAM_CHAT, text=message[i:i+4000], parse_mode="Markdown")
             await asyncio.sleep(0.5)
 
-
 def send_telegram(message):
-    """Send message from scheduler (background thread) safely."""
     try:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
@@ -1454,180 +1642,432 @@ def send_telegram(message):
 # SCHEDULED JOB HANDLERS
 # ============================================================================
 
-def job_market_report():
-    logger.info("📊 Sending market report...")
+def job_premarket_scan():
+    """
+    Pre-market scan: every 30min from 6:30am to 11:30am ET.
+    Runs Portfolio Protection + Growth + Watchlist signals.
+    Also checks earnings alerts at 7am.
+    """
+    logger.info("⏰ Pre-market scan running...")
     try:
-        vix       = get_vix()
-        portfolio = get_portfolio_data()
-        market    = get_market_metrics()
-        send_telegram(format_market_report(portfolio, market, vix))
-        logger.info("✅ Market report sent")
+        vix      = get_vix()
+        pnl_data = get_portfolio_pnl()
+        sc       = pnl_data.get("stock_cache", {})
+
+        # Portfolio signals
+        protection, growth = run_portfolio_signals(vix, sc)
+        watchlist          = run_watchlist_signals(vix)
+
+        if protection or growth or watchlist:
+            msg = format_portfolio_signals(protection, growth, watchlist, vix)
+            send_telegram(msg)
+        else:
+            logger.info("✅ Pre-market scan: no actionable signals")
+
+        # Earnings check
+        hour = datetime.now(EST).hour
+        if hour == 7:
+            alerts = check_earnings_alerts()
+            msg    = format_earnings_alerts(alerts)
+            if msg:
+                send_telegram(msg)
+    except Exception as e:
+        logger.error(f"job_premarket_scan: {e}")
+
+
+def job_market_report():
+    """Regular market hours report — every 60min 9:30am–3:30pm ET."""
+    logger.info("📊 Market report running...")
+    try:
+        vix      = get_vix()
+        pnl_data = get_portfolio_pnl()
+        market   = get_market_metrics()
+        send_telegram(format_market_report(pnl_data, market, vix))
+
+        # Also run signals during market hours
+        sc = pnl_data.get("stock_cache", {})
+        protection, growth = run_portfolio_signals(vix, sc)
+        watchlist          = run_watchlist_signals(vix)
+        if protection or growth or watchlist:
+            time.sleep(2)
+            send_telegram(format_portfolio_signals(protection, growth, watchlist, vix))
     except Exception as e:
         logger.error(f"job_market_report: {e}")
 
 
-def job_trading_signals():
-    logger.info("📈 Sending trading signals...")
+def job_eod_summary():
+    """EOD summary at 4:15pm ET — portfolio value, daily P&L, gainers/losers."""
+    logger.info("🔔 EOD summary running...")
+    try:
+        vix      = get_vix()
+        pnl_data = get_portfolio_pnl()
+        market   = get_market_metrics()
+        send_telegram(format_eod_summary(pnl_data, market, vix))
+    except Exception as e:
+        logger.error(f"job_eod_summary: {e}")
+
+
+def job_postmarket_scan():
+    """Post-market scan: every 30min 4:00pm–6:00pm ET. Option Hunter + Swing + Signals."""
+    logger.info("📡 Post-market scan running...")
     try:
         vix = get_vix()
-        send_telegram(format_trading_signals(vix))
-        logger.info("✅ Trading signals sent")
-    except Exception as e:
-        logger.error(f"job_trading_signals: {e}")
 
-
-def job_earnings_alert():
-    logger.info("📅 Checking earnings alerts...")
-    try:
-        alerts = check_earnings_alerts()
-        msg    = format_earnings_alerts(alerts)
-        if msg:
-            send_telegram(msg)
-            logger.info(f"✅ Earnings alert sent ({len(alerts)} stock(s))")
-        else:
-            logger.info("✅ No upcoming earnings in 1-2 days")
-    except Exception as e:
-        logger.error(f"job_earnings_alert: {e}")
-
-
-def job_swing_trades():
-    logger.info("📊 Running Swing Trade Scanner...")
-    try:
-        vix    = get_vix()
-        setups = run_swing_scanner(vix)
-        send_telegram(format_swing_trades(setups, vix))
-        logger.info(f"✅ Swing trades sent ({len(setups)} setup(s))")
-    except Exception as e:
-        logger.error(f"job_swing_trades: {e}")
-
-
-def job_option_hunter():
-    logger.info("🎯 Sending Reminders + Option Hunter + Swing Trades...")
-    vix = get_vix()
-
-    # ── Message 0: Reminders (above Option Hunter) ────────────────────────────
-    try:
         reminder_msg = format_reminders_section()
         if reminder_msg:
             send_telegram(reminder_msg)
-            logger.info("✅ Reminders sent")
             time.sleep(2)
-    except Exception as e:
-        logger.error(f"❌ Reminders failed: {e}")
 
-    # ── Message 1: Option Hunter ──────────────────────────────────────────────
-    try:
         opps = run_option_hunter(vix)
         send_telegram(format_option_hunter(opps, vix))
-        logger.info(f"✅ Option Hunter sent ({len(opps)} setup(s))")
-    except Exception as e:
-        logger.error(f"❌ Option Hunter failed: {e}")
-        send_telegram(f"❌ Option Hunter error: {e}")
+        time.sleep(3)
 
-    time.sleep(3)
-
-    # ── Message 2: Swing Trades ───────────────────────────────────────────────
-    logger.info("📊 Sending Swing Trades...")
-    try:
         setups = run_swing_scanner(vix)
-        msg    = format_swing_trades(setups, vix)
-        send_telegram(msg)
-        logger.info(f"✅ Swing Trades sent ({len(setups)} setup(s))")
+        send_telegram(format_swing_trades(setups, vix))
+
+        # Post-market portfolio signals
+        pnl_data = get_portfolio_pnl()
+        sc = pnl_data.get("stock_cache", {})
+        protection, growth = run_portfolio_signals(vix, sc)
+        watchlist          = run_watchlist_signals(vix)
+        if protection or growth or watchlist:
+            time.sleep(2)
+            send_telegram(format_portfolio_signals(protection, growth, watchlist, vix))
     except Exception as e:
-        logger.error(f"❌ Swing Trades failed: {e}")
-        send_telegram(f"❌ Swing Trades error: {e}")
+        logger.error(f"job_postmarket_scan: {e}")
 
 
 # ============================================================================
 # TELEGRAM COMMAND HANDLERS
 # ============================================================================
 
-def _format_portfolio_summary():
-    """Returns a formatted portfolio summary string using live prices."""
-    total_cost = total_value = 0
-    lines = []
-    for ticker, info in live_portfolio.items():
-        try:
-            data  = get_stock_data(ticker)
-            price = data["current_price"] if data else None
-            if not price:
-                lines.append(f"⚪ {ticker}: price unavailable")
-                continue
-            shares   = info["shares"]
-            avg_cost = info["avg_cost"]
-            cost     = shares * avg_cost
-            value    = shares * price
-            pnl      = value - cost
-            pnl_pct  = (pnl / cost * 100) if cost > 0 else 0
-            total_cost  += cost
-            total_value += value
-            emoji = "🟢" if pnl >= 0 else "🔴"
-            lines.append(
-                f"{emoji} *{ticker}*: {shares} shares @ ${avg_cost:.2f} avg\n"
-                f"   Now: ${price:.2f} | P&L: ${pnl:+.0f} ({pnl_pct:+.1f}%)"
+# ── Portfolio Management ──────────────────────────────────────────────────────
+
+def _portfolio_summary_text():
+    pnl_data = get_portfolio_pnl()
+    positions = pnl_data.get("positions", {})
+    if not positions:
+        return "💼 Portfolio is empty. Use /add to add positions."
+
+    stock_lines, opt_lines = [], []
+    for key, pos in sorted(positions.items(), key=lambda x: -abs(x[1]["pnl"])):
+        e = "🟢" if pos["pnl"] >= 0 else "🔴"
+        if pos["asset_type"] == "stock":
+            stock_lines.append(
+                f"{e} *{pos['ticker']}*: {pos['shares']:.0f} @ ${pos['avg_cost']:.2f}\n"
+                f"   ${pos['price']:.2f} | P&L: ${pos['pnl']:+.0f} ({pos['pnl_pct']:+.1f}%)"
             )
-        except Exception as e:
-            lines.append(f"⚪ {ticker}: error ({e})")
+        else:
+            strike_str = f"${pos['strike']:.0f}" if pos.get("strike") else ""
+            etype = pos["asset_type"].upper()
+            opt_lines.append(
+                f"{e} *{pos['ticker']}* {strike_str} {etype} exp {pos.get('expiry','')} ({pos.get('contracts',1)}ct @ ${pos.get('avg_cost',0):.2f})\n"
+                f"   P&L: ${pos['pnl']:+.0f} ({pos['pnl_pct']:+.1f}%) [{pos.get('status','')}]"
+            )
 
-    total_pnl     = total_value - total_cost
-    total_pnl_pct = (total_pnl / total_cost * 100) if total_cost > 0 else 0
-    emoji         = "🟢" if total_pnl >= 0 else "🔴"
+    msg  = "💼 *PORTFOLIO*\n\n"
+    if stock_lines:
+        msg += "📈 *Stocks:*\n" + "\n".join(stock_lines) + "\n\n"
+    if opt_lines:
+        msg += "🎯 *Options:*\n" + "\n".join(opt_lines) + "\n\n"
 
-    msg  = "💼 *CURRENT PORTFOLIO*\n\n"
-    msg += "\n".join(lines)
-    msg += f"\n\n{'='*30}\n"
-    msg += f"{emoji} *TOTAL P&L: ${total_pnl:+.0f} ({total_pnl_pct:+.1f}%)*\n"
-    msg += f"Value: ${total_value:,.0f} | Cost: ${total_cost:,.0f}"
+    msg += "=" * 30 + "\n"
+    e = "🟢" if pnl_data["total_pnl"] >= 0 else "🔴"
+    daily_e = "🟢" if pnl_data["daily_pnl"] >= 0 else "🔴"
+    msg += f"💰 Value: ${pnl_data['total_value']:,.0f} | Cost: ${pnl_data['total_cost']:,.0f}\n"
+    msg += f"{e} *Total P&L: ${pnl_data['total_pnl']:+.0f} ({pnl_data['total_pnl_pct']:+.1f}%)*\n"
+    msg += f"{daily_e} *Today: ${pnl_data['daily_pnl']:+.0f}*"
     return msg
 
 
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/start — welcome message and quick command guide"""
-    name = user_settings.get("name", "")
-    if name:
-        msg  = f"👋 Welcome back, *{name}*!\n\n"
-        msg += "Your bot is live and running. Use:\n\n"
-        msg += "/portfolio — view live P&L\n"
-        msg += "/scan — run Option Hunter + Swing scan\n"
-        msg += "/remind TICKER — analyze a stock\n"
-        msg += "/help — all commands"
+async def cmd_portfolio(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/portfolio — live P&L for all stocks and options"""
+    await update.message.reply_text("⏳ Fetching live prices...")
+    try:
+        await update.message.reply_text(_portfolio_summary_text(), parse_mode="Markdown")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {e}")
+
+
+async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /add TICKER SHARES PRICE [stock|call|put] [STRIKE] [EXPIRY YYYY-MM-DD]
+
+    Examples:
+      /add NVDA 10 175.90              → stock (default)
+      /add NVDA 1 12.00 call 200 2026-06-18  → call option
+      /add SPY 2 5.50 put 500 2026-05-15     → put option
+    """
+    try:
+        args = context.args
+        if len(args) < 3:
+            await update.message.reply_text(
+                "❌ *Usage:*\n"
+                "`/add TICKER SHARES PRICE` — stock\n"
+                "`/add TICKER CONTRACTS PREMIUM call STRIKE EXPIRY` — call option\n"
+                "`/add TICKER CONTRACTS PREMIUM put STRIKE EXPIRY` — put option\n\n"
+                "Examples:\n"
+                "`/add NVDA 10 175.90`\n"
+                "`/add NVDA 1 12.00 call 200 2026-06-18`",
+                parse_mode="Markdown"
+            )
+            return
+
+        ticker     = args[0].upper()
+        qty        = float(args[1])
+        price      = float(args[2])
+        asset_type = args[3].lower() if len(args) > 3 else "stock"
+        strike     = float(args[4]) if len(args) > 4 else None
+        expiry     = args[5] if len(args) > 5 else None
+
+        if asset_type not in ("stock", "call", "put"):
+            await update.message.reply_text("❌ Asset type must be: stock, call, or put")
+            return
+
+        key = _make_position_key(ticker, asset_type, strike, expiry)
+
+        if key in live_portfolio and asset_type == "stock":
+            # Weighted average for stocks
+            old    = live_portfolio[key]
+            new_sh = old["shares"] + qty
+            new_avg = ((old["shares"] * old["avg_cost"]) + (qty * price)) / new_sh
+            live_portfolio[key]["shares"]   = new_sh
+            live_portfolio[key]["avg_cost"] = round(new_avg, 3)
+            action = f"Updated: {new_sh:.0f} shares @ ${new_avg:.3f} avg"
+        else:
+            live_portfolio[key] = {
+                "asset_type": asset_type,
+                "ticker":     ticker,
+                "shares":     qty if asset_type == "stock" else None,
+                "avg_cost":   price,
+                "entry_date": datetime.now(EST).strftime("%Y-%m-%d"),
+                "strike":     strike,
+                "expiry":     expiry,
+                "contracts":  qty if asset_type != "stock" else None,
+            }
+            action = "New position added"
+
+        save_portfolio(live_portfolio)
+
+        type_label = asset_type.upper()
+        if asset_type != "stock":
+            msg = (f"✅ *ADDED: {qty:.0f}ct {ticker} {strike} {type_label} "
+                   f"exp {expiry} @ ${price:.2f}/share*\n{action}\n"
+                   f"Contract cost: ${price * 100 * qty:,.0f}")
+        else:
+            msg = (f"✅ *ADDED: {qty:.0f} {ticker} @ ${price:.2f}*\n{action}\n"
+                   f"Position value: ${qty * price:,.0f}")
+        await update.message.reply_text(msg, parse_mode="Markdown")
+
+    except ValueError:
+        await update.message.reply_text("❌ Invalid numbers. Check your input.")
+    except Exception as e:
+        logger.error(f"cmd_add: {e}")
+        await update.message.reply_text(f"❌ Error: {e}")
+
+
+async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /delete TICKER [stock|call|put] [STRIKE] [EXPIRY]
+    /delete list — show all position keys
+    """
+    try:
+        if not context.args:
+            await update.message.reply_text("Usage: `/delete TICKER` or `/delete list`", parse_mode="Markdown")
+            return
+
+        if context.args[0].lower() == "list":
+            lines = [f"`{k}` — {v['ticker']} {v['asset_type']}" for k, v in live_portfolio.items()]
+            msg   = "📋 *Position keys:*\n" + "\n".join(lines) + "\n\nUse full key with `/delete KEY`"
+            await update.message.reply_text(msg, parse_mode="Markdown")
+            return
+
+        ticker     = context.args[0].upper()
+        asset_type = context.args[1].lower() if len(context.args) > 1 else "stock"
+        strike     = float(context.args[2]) if len(context.args) > 2 else None
+        expiry     = context.args[3] if len(context.args) > 3 else None
+
+        key = _make_position_key(ticker, asset_type, strike, expiry)
+
+        # Also try exact key match if user typed it directly
+        if key not in live_portfolio and ticker in live_portfolio:
+            key = ticker  # Legacy key
+
+        if key not in live_portfolio:
+            # Fuzzy match on ticker
+            matches = [k for k, v in live_portfolio.items() if v["ticker"] == ticker]
+            if not matches:
+                await update.message.reply_text(f"❌ {ticker} not found. Use `/delete list` to see all keys.", parse_mode="Markdown")
+                return
+            if len(matches) == 1:
+                key = matches[0]
+            else:
+                lines = [f"`{m}`" for m in matches]
+                await update.message.reply_text(
+                    f"Multiple positions for {ticker}:\n" + "\n".join(lines) + "\n\nSpecify: `/delete TICKER TYPE STRIKE EXPIRY`",
+                    parse_mode="Markdown"
+                )
+                return
+
+        pos = live_portfolio.pop(key)
+        save_portfolio(live_portfolio)
+        await update.message.reply_text(
+            f"✅ Deleted: *{pos['ticker']}* {pos['asset_type'].upper()} position",
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        logger.error(f"cmd_delete: {e}")
+        await update.message.reply_text(f"❌ Error: {e}")
+
+
+async def cmd_amend(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /amend TICKER [stock] FIELD VALUE
+    Fields: shares, avg_cost, contracts, strike, expiry
+    Example: /amend RKLB shares 70
+             /amend RKLB avg_cost 65.00
+    """
+    try:
+        if len(context.args) < 3:
+            await update.message.reply_text(
+                "Usage: `/amend TICKER FIELD VALUE`\n"
+                "Fields: shares, avg_cost, contracts, strike, expiry\n\n"
+                "Examples:\n"
+                "`/amend RKLB shares 70`\n"
+                "`/amend RKLB avg_cost 65.00`",
+                parse_mode="Markdown"
+            )
+            return
+
+        ticker = context.args[0].upper()
+        field  = context.args[1].lower()
+        value  = context.args[2]
+
+        # Find matching position
+        matches = [k for k, v in live_portfolio.items() if v["ticker"] == ticker]
+        if not matches:
+            await update.message.reply_text(f"❌ {ticker} not found in portfolio.")
+            return
+        if len(matches) > 1:
+            lines = [f"`{m}` — {live_portfolio[m]['asset_type']}" for m in matches]
+            await update.message.reply_text(
+                f"Multiple positions for {ticker}:\n" + "\n".join(lines) + "\n\nUse `/delete list` for exact keys.",
+                parse_mode="Markdown"
+            )
+            return
+
+        key = matches[0]
+        valid_fields = {"shares", "avg_cost", "contracts", "strike", "expiry", "entry_date"}
+        if field not in valid_fields:
+            await update.message.reply_text(f"❌ Field '{field}' not valid. Choose from: {', '.join(valid_fields)}")
+            return
+
+        # Type-cast
+        if field in ("shares", "contracts"):
+            live_portfolio[key][field] = float(value)
+        elif field in ("avg_cost", "strike"):
+            live_portfolio[key][field] = float(value)
+        else:
+            live_portfolio[key][field] = value
+
+        save_portfolio(live_portfolio)
+        await update.message.reply_text(
+            f"✅ Updated *{ticker}* — {field} → {value}",
+            parse_mode="Markdown"
+        )
+    except ValueError:
+        await update.message.reply_text("❌ Invalid value. Numbers for shares/avg_cost/strike.")
+    except Exception as e:
+        logger.error(f"cmd_amend: {e}")
+        await update.message.reply_text(f"❌ Error: {e}")
+
+
+# ── Watchlist Commands ────────────────────────────────────────────────────────
+
+async def cmd_watchlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /watchlist add TICKER
+    /watchlist remove TICKER
+    /watchlist view
+    """
+    global live_watchlist
+    try:
+        if not context.args:
+            # Default: show watchlist
+            msg = "📋 *YOUR WATCHLIST*\n\n"
+            msg += ", ".join(f"`{t}`" for t in live_watchlist) if live_watchlist else "_Empty_"
+            msg += "\n\nCommands:\n`/watchlist add TICKER`\n`/watchlist remove TICKER`\n`/watchlist view`"
+            await update.message.reply_text(msg, parse_mode="Markdown")
+            return
+
+        sub = context.args[0].lower()
+
+        if sub == "view":
+            msg = "📋 *YOUR WATCHLIST*\n\n"
+            msg += ", ".join(f"`{t}`" for t in live_watchlist) if live_watchlist else "_Empty_"
+            await update.message.reply_text(msg, parse_mode="Markdown")
+
+        elif sub == "add":
+            if len(context.args) < 2:
+                await update.message.reply_text("Usage: `/watchlist add TICKER`", parse_mode="Markdown")
+                return
+            ticker = context.args[1].upper()
+            if ticker in live_watchlist:
+                await update.message.reply_text(f"ℹ️ {ticker} already on watchlist.")
+                return
+            live_watchlist.append(ticker)
+            save_watchlist(live_watchlist)
+            await update.message.reply_text(f"✅ *{ticker}* added to watchlist.", parse_mode="Markdown")
+
+        elif sub == "remove":
+            if len(context.args) < 2:
+                await update.message.reply_text("Usage: `/watchlist remove TICKER`", parse_mode="Markdown")
+                return
+            ticker = context.args[1].upper()
+            if ticker not in live_watchlist:
+                await update.message.reply_text(f"❌ {ticker} not found on watchlist.")
+                return
+            live_watchlist.remove(ticker)
+            save_watchlist(live_watchlist)
+            await update.message.reply_text(f"✅ *{ticker}* removed from watchlist.", parse_mode="Markdown")
+
+        else:
+            await update.message.reply_text("Usage: `/watchlist add|remove|view TICKER`", parse_mode="Markdown")
+
+    except Exception as e:
+        logger.error(f"cmd_watchlist: {e}")
+        await update.message.reply_text(f"❌ Error: {e}")
+
+
+# ── Info & Scan Commands ──────────────────────────────────────────────────────
+
+async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/scan — full manual scan: signals + option hunter + swing trades"""
+    await update.message.reply_text("🔍 Running full scan... ~2 minutes")
+    try:
+        vix        = get_vix()
+        pnl_data   = get_portfolio_pnl()
+        sc         = pnl_data.get("stock_cache", {})
+        protection, growth = run_portfolio_signals(vix, sc)
+        watchlist  = run_watchlist_signals(vix)
+        opps       = run_option_hunter(vix)
+        setups     = run_swing_scanner(vix)
+
+        await update.message.reply_text(format_portfolio_signals(protection, growth, watchlist, vix), parse_mode="Markdown")
+        await update.message.reply_text(format_option_hunter(opps, vix), parse_mode="Markdown")
+        await update.message.reply_text(format_swing_trades(setups, vix), parse_mode="Markdown")
+    except Exception as e:
+        logger.error(f"cmd_scan: {e}")
+        await update.message.reply_text(f"❌ Error: {e}")
+
+
+async def cmd_vix(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/vix — VIX level and sentiment"""
+    vix = get_vix()
+    if vix:
+        msg = f"{vix['emoji']} *VIX: {vix['level']:.2f}*\n{vix['sentiment']}"
     else:
-        msg  = "🤖 *Welcome to Milnai Trading Bot!*\n\n"
-        msg += "I help you track your portfolio, find option setups and swing trades — all via Telegram.\n\n"
-        msg += "*Quick start:*\n"
-        msg += "/portfolio — see your holdings\n"
-        msg += "/scan — run full market scan now\n"
-        msg += "/buy NVDA 10 201.50 — add a position\n"
-        msg += "/remind NVDA — analyze a stock\n"
-        msg += "/help — see all commands\n\n"
-        msg += "📅 Automatic alerts fire Mon–Fri during US market hours."
-    await update.message.reply_text(msg, parse_mode="Markdown")
-
-
-async def cmd_setup(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/setup — show setup instructions"""
-    msg  = "⚙️ *Bot Setup*\n\n"
-    msg += "*Step 1 — Add your holdings:*\n"
-    msg += "`/buy TICKER SHARES AVGPRICE`\n"
-    msg += "e.g. `/buy NVDA 10 175.90`\n\n"
-    msg += "*Step 2 — Set swing capital:*\n"
-    msg += "`/capital 2000`\n\n"
-    msg += "*Step 3 — Check it works:*\n"
-    msg += "`/portfolio` — see your P&L\n"
-    msg += "`/vix` — check market mood\n"
-    msg += "`/scan` — run a manual scan\n\n"
-    msg += "That's it! Automatic alerts will fire during US market hours."
-    await update.message.reply_text(msg, parse_mode="Markdown")
-
-
-async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/done — confirm setup complete"""
-    count = len(live_portfolio)
-    cap   = user_settings.get("swing_capital", 2000)
-    msg   = f"✅ *Setup confirmed!*\n\n"
-    msg  += f"📋 Holdings: {count} position(s)\n"
-    msg  += f"💰 Swing capital: ${cap:,}\n\n"
-    msg  += "Your bot is now live. Use /help to see all commands."
+        msg = "❌ Could not fetch VIX."
     await update.message.reply_text(msg, parse_mode="Markdown")
 
 
@@ -1637,366 +2077,161 @@ async def cmd_capital(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         if not context.args:
             cap = user_settings.get("swing_capital", 2000)
-            await update.message.reply_text(
-                f"💰 Current swing capital: *${cap:,}*\n"
-                f"To change: `/capital 3000`",
-                parse_mode="Markdown"
-            )
+            await update.message.reply_text(f"💰 Swing capital: *${cap:,}*\nChange: `/capital 3000`", parse_mode="Markdown")
             return
         capital = float(context.args[0])
         if capital <= 0:
-            await update.message.reply_text("❌ Capital must be a positive number.")
+            await update.message.reply_text("❌ Must be positive.")
             return
         user_settings["swing_capital"] = capital
         save_settings(user_settings)
-        await update.message.reply_text(
-            f"✅ Swing capital updated to *${capital:,.0f}*\n"
-            f"Risk per trade: ~${capital*0.03:.0f} (3% VIX-calibrated)",
-            parse_mode="Markdown"
-        )
+        await update.message.reply_text(f"✅ Swing capital → *${capital:,.0f}*", parse_mode="Markdown")
     except ValueError:
         await update.message.reply_text("❌ Usage: `/capital 2000`", parse_mode="Markdown")
 
 
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle free text — guide user to commands"""
-    text = update.message.text.strip()
-    if text and not text.startswith("/"):
-        await update.message.reply_text(
-            "💬 Use commands to talk to me. Type /help to see what I can do.",
-            parse_mode="Markdown"
-        )
-
-
 async def cmd_remind(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /remind TICKER — analyze stock and offer to set a reminder
-    /remind TICKER BUY 200.00 2026-05-15 — add price+date reminder directly
-    /remind TICKER SELL 250.00 — add price-only reminder
-    """
+    """/remind TICKER — analyze | /remind TICKER BUY/SELL PRICE [DATE]"""
     try:
         if not context.args:
             await update.message.reply_text(
-                "📅 *How to use /remind:*\n\n"
-                "Analyze a stock:\n"
-                "`/remind NVDA`\n\n"
-                "Set a buy reminder at price:\n"
-                "`/remind NVDA BUY 190.00`\n\n"
-                "Set a sell reminder at price:\n"
-                "`/remind NVDA SELL 220.00`\n\n"
-                "Set a date reminder:\n"
-                "`/remind NVDA BUY 190.00 2026-05-15`\n\n"
-                "See all reminders:\n"
-                "`/reminders`",
+                "📅 *Remind usage:*\n"
+                "`/remind NVDA` — analyze\n"
+                "`/remind NVDA BUY 190.00` — price alert\n"
+                "`/remind NVDA SELL 220.00 2026-05-15` — price+date",
                 parse_mode="Markdown"
             )
             return
 
         ticker = context.args[0].upper()
-
-        # Quick add mode: /remind TICKER BUY/SELL PRICE [DATE]
         if len(context.args) >= 3:
             action       = context.args[1].upper()
             target_price = float(context.args[2])
             remind_date  = context.args[3] if len(context.args) >= 4 else None
-
-            if action not in ("BUY", "SELL", "WATCH"):
-                await update.message.reply_text("❌ Action must be BUY, SELL or WATCH")
-                return
-
-            # Get current price for context
-            data    = get_stock_data(ticker)
-            current = data["current_price"] if data else None
-
             reminder = {
-                "ticker":       ticker,
-                "action":       action,
-                "target_price": target_price,
-                "remind_date":  remind_date,
-                "note":         f"Set via /remind on {datetime.now(EST).strftime('%Y-%m-%d')}",
-                "added":        datetime.now(EST).strftime("%Y-%m-%d"),
+                "ticker": ticker, "action": action,
+                "target_price": target_price, "remind_date": remind_date,
+                "note": f"Set {datetime.now(EST).strftime('%Y-%m-%d')}",
+                "added": datetime.now(EST).strftime("%Y-%m-%d"),
             }
             reminders.append(reminder)
             save_reminders(reminders)
-
-            msg  = f"✅ *Reminder Set!*\n\n"
-            msg += f"{'🟢' if action == 'BUY' else '🔴'} {action} *{ticker}* @ ${target_price:.2f}\n"
+            data    = get_stock_data(ticker)
+            current = data["current_price"] if data else None
+            msg  = f"✅ *Reminder Set!*\n{'🟢' if action=='BUY' else '🔴'} {action} *{ticker}* @ ${target_price:.2f}\n"
             if current:
-                diff = ((current - target_price) / target_price * 100)
-                msg += f"Current price: ${current:.2f} ({diff:+.1f}% away)\n"
+                msg += f"Now: ${current:.2f} ({((current-target_price)/target_price*100):+.1f}% away)\n"
             if remind_date:
                 msg += f"Date: {remind_date}\n"
-            msg += f"\nI'll alert you in the Reminders section above Option Hunter. 🔔"
             await update.message.reply_text(msg, parse_mode="Markdown")
             return
 
-        # Analysis mode: /remind TICKER
-        await update.message.reply_text(f"🔍 Analyzing *{ticker}*... (~15 seconds)", parse_mode="Markdown")
-
-        analysis = analyze_for_reminder(ticker)
-        if not analysis:
-            await update.message.reply_text(f"❌ Could not fetch data for {ticker}. Check the ticker symbol.")
+        await update.message.reply_text(f"🔍 Analyzing *{ticker}*... (~15 sec)", parse_mode="Markdown")
+        data = get_stock_data(ticker)
+        if not data:
+            await update.message.reply_text(f"❌ No data for {ticker}.")
             return
+        scored = score_ticker(data)
+        if not scored:
+            await update.message.reply_text(f"❌ Could not score {ticker}.")
+            return
+        score  = scored["score"]
+        price  = data["current_price"]
+        conf   = score_to_confidence(score)
+        sig    = classify_signal(score)
+        sig_labels = {"STRONG_BUY": "🟢🟢 STRONG BUY", "MEDIUM_BUY": "🟢 BUY",
+                      "STRONG_SELL": "🔴🔴 STRONG SELL", "WEAK_SELL": "🔴 TRIM"}
+        verdict = sig_labels.get(sig, "⏸️ HOLD / NEUTRAL")
+        action  = "BUY" if sig in ("STRONG_BUY","MEDIUM_BUY") else ("SELL" if sig in ("STRONG_SELL","WEAK_SELL") else "WATCH")
+        bb = scored.get("bb")
+        suggestion = f"Entry near ${bb['lower']:.2f} (BB lower)" if bb and action == "BUY" else (
+                     f"Exit near ${bb['upper']:.2f} (BB upper)" if bb and action == "SELL" else "No clear entry")
+        earn_warn = ""
+        earn_date = EARNINGS_CALENDAR.get(ticker)
+        if earn_date:
+            days = (datetime.strptime(earn_date, "%Y-%m-%d").date() - datetime.now(EST).date()).days
+            if 0 <= days <= 14:
+                earn_warn = f"\n⚠️ Earnings in {days} days ({earn_date})"
 
-        a = analysis
         msg  = f"📊 *{ticker} ANALYSIS*\n\n"
-        msg += f"Price: ${a['price']:.2f} | Score: {a['score']:+d}/6\n"
-        msg += f"Verdict: {a['verdict']}\n"
-        if a['rsi']:
-            msg += f"RSI: {a['rsi']} | "
-        msg += f"\n💡 {a['suggestion']}\n\n"
-
-        if a['earn_warning']:
-            msg += f"{a['earn_warning']}\n\n"
-
-        msg += "Top signals:\n"
-        for d in a['details'][:4]:
+        msg += f"Price: ${price:.2f} | Score: {score:+d}/6 | Confidence: {conf:.0%}\n"
+        msg += f"Verdict: {verdict}\n"
+        msg += f"💡 {suggestion}{earn_warn}\n\nTop signals:\n"
+        for d in scored["details"][:4]:
             msg += f"  {d}\n"
-
-        msg += f"\n━━━━━━━━━━━━━━━━━━━━\n"
-        msg += f"Want to set a reminder?\n\n"
-        msg += f"📅 *By date:*\n`/remind {ticker} {a['action']} {a['price']:.2f} YYYY-MM-DD`\n\n"
-        msg += f"💰 *By price:*\n`/remind {ticker} {a['action']} {a['price']:.2f}`\n\n"
-        msg += f"_Replace date/price with your target_"
-
+        msg += f"\n━━━━━━━━━━━━━━━━\nSet a reminder:\n`/remind {ticker} {action} {price:.2f}`\n`/remind {ticker} {action} {price:.2f} YYYY-MM-DD`"
         await update.message.reply_text(msg, parse_mode="Markdown")
-
-    except ValueError:
-        await update.message.reply_text("❌ Invalid price. Example: `/remind NVDA BUY 190.00`", parse_mode="Markdown")
     except Exception as e:
-        logger.error(f"cmd_remind error: {e}")
+        logger.error(f"cmd_remind: {e}")
         await update.message.reply_text(f"❌ Error: {e}")
 
 
 async def cmd_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/reminders — show and manage all active reminders"""
     if not reminders:
-        await update.message.reply_text(
-            "📅 No reminders set.\n\nUse `/remind TICKER` to add one.",
-            parse_mode="Markdown"
-        )
+        await update.message.reply_text("📅 No reminders. Use `/remind TICKER` to add.", parse_mode="Markdown")
         return
-
     msg = "🔔 *YOUR REMINDERS*\n\n"
     for i, r in enumerate(reminders, 1):
-        ticker = r["ticker"]
         action = r["action"]
         emoji  = "🟢" if action == "BUY" else "🔴"
-
+        msg += f"{i}. {emoji} {action} *{r['ticker']}*"
         if r.get("target_price"):
-            msg += f"{i}. {emoji} {action} *{ticker}* @ ${float(r['target_price']):.2f}"
+            msg += f" @ ${float(r['target_price']):.2f}"
         if r.get("remind_date"):
             msg += f" | 📅 {r['remind_date']}"
         if r.get("note"):
             msg += f"\n   _{r['note']}_"
         msg += "\n\n"
-
-    msg += "━━━━━━━━━━━━━━━━━━━━\n"
-    msg += "To delete: `/delreminder 1` (use number above)\n"
-    msg += "To add: `/remind TICKER`"
+    msg += "Delete: `/delreminder 1`"
     await update.message.reply_text(msg, parse_mode="Markdown")
 
 
 async def cmd_delreminder(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/delreminder N — delete reminder by number"""
     try:
         if not context.args:
             await update.message.reply_text("Usage: `/delreminder 1`", parse_mode="Markdown")
             return
         idx = int(context.args[0]) - 1
         if idx < 0 or idx >= len(reminders):
-            await update.message.reply_text(f"❌ No reminder #{idx+1}. Use /reminders to see the list.")
+            await update.message.reply_text("❌ Invalid number. Use /reminders to see list.")
             return
         removed = reminders.pop(idx)
         save_reminders(reminders)
-        await update.message.reply_text(
-            f"✅ Deleted: {removed['action']} {removed['ticker']} reminder.",
-            parse_mode="Markdown"
-        )
+        await update.message.reply_text(f"✅ Deleted: {removed['action']} {removed['ticker']}")
     except ValueError:
-        await update.message.reply_text("❌ Use a number. Example: `/delreminder 1`", parse_mode="Markdown")
-    except Exception as e:
-        await update.message.reply_text(f"❌ Error: {e}")
+        await update.message.reply_text("❌ Use a number. `/delreminder 1`", parse_mode="Markdown")
 
 
-async def cmd_buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /buy TICKER SHARES PRICE
-    Example: /buy NVDA 10 201.50
-    Adds or updates a position with weighted average cost.
-    """
-    try:
-        if len(context.args) != 3:
-            await update.message.reply_text(
-                "❌ Usage: /buy TICKER SHARES PRICE\nExample: /buy NVDA 10 201.50"
-            )
-            return
-
-        ticker = context.args[0].upper()
-        shares = float(context.args[1])
-        price  = float(context.args[2])
-
-        if shares <= 0 or price <= 0:
-            await update.message.reply_text("❌ Shares and price must be positive numbers.")
-            return
-
-        if ticker in live_portfolio:
-            # Recalculate weighted average cost
-            old_shares   = live_portfolio[ticker]["shares"]
-            old_avg      = live_portfolio[ticker]["avg_cost"]
-            new_shares   = old_shares + shares
-            new_avg      = ((old_shares * old_avg) + (shares * price)) / new_shares
-            live_portfolio[ticker]["shares"]   = new_shares
-            live_portfolio[ticker]["avg_cost"] = round(new_avg, 3)
-            action = f"Added to existing position\nNew avg cost: ${new_avg:.3f}"
-        else:
-            live_portfolio[ticker] = {"shares": shares, "avg_cost": price}
-            action = "New position opened"
-
-        save_portfolio(live_portfolio)
-
-        msg  = f"✅ *BOUGHT: {shares:.0f} {ticker} @ ${price:.2f}*\n"
-        msg += f"{action}\n"
-        msg += f"Total shares: {live_portfolio[ticker]['shares']:.0f}\n"
-        msg += f"Avg cost: ${live_portfolio[ticker]['avg_cost']:.3f}\n"
-        msg += f"Position value: ${live_portfolio[ticker]['shares'] * price:,.0f}"
-        await update.message.reply_text(msg, parse_mode="Markdown")
-
-    except ValueError:
-        await update.message.reply_text("❌ Invalid input. Example: /buy NVDA 10 201.50")
-    except Exception as e:
-        logger.error(f"cmd_buy error: {e}")
-        await update.message.reply_text(f"❌ Error: {e}")
-
-
-async def cmd_sell(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /sell TICKER SHARES PRICE
-    Example: /sell RKLB 20 85.00
-    Reduces position and calculates realised P&L.
-    """
-    try:
-        if len(context.args) != 3:
-            await update.message.reply_text(
-                "❌ Usage: /sell TICKER SHARES PRICE\nExample: /sell RKLB 20 85.00"
-            )
-            return
-
-        ticker     = context.args[0].upper()
-        sell_shares = float(context.args[1])
-        sell_price  = float(context.args[2])
-
-        if ticker not in live_portfolio:
-            await update.message.reply_text(
-                f"❌ {ticker} not found in portfolio. Use /portfolio to see holdings."
-            )
-            return
-
-        held   = live_portfolio[ticker]["shares"]
-        avg    = live_portfolio[ticker]["avg_cost"]
-
-        if sell_shares > held:
-            await update.message.reply_text(
-                f"❌ You only hold {held:.0f} shares of {ticker}. Cannot sell {sell_shares:.0f}."
-            )
-            return
-
-        # Calculate realised P&L
-        pnl     = (sell_price - avg) * sell_shares
-        pnl_pct = ((sell_price - avg) / avg * 100) if avg > 0 else 0
-
-        remaining = held - sell_shares
-        if remaining <= 0:
-            del live_portfolio[ticker]
-            position_note = "Position fully closed."
-        else:
-            live_portfolio[ticker]["shares"] = remaining
-            position_note = f"Remaining: {remaining:.0f} shares @ ${avg:.3f} avg"
-
-        save_portfolio(live_portfolio)
-
-        emoji = "🟢" if pnl >= 0 else "🔴"
-        msg  = f"✅ *SOLD: {sell_shares:.0f} {ticker} @ ${sell_price:.2f}*\n"
-        msg += f"{emoji} Realised P&L: ${pnl:+.0f} ({pnl_pct:+.1f}%)\n"
-        msg += f"{position_note}"
-        await update.message.reply_text(msg, parse_mode="Markdown")
-
-    except ValueError:
-        await update.message.reply_text("❌ Invalid input. Example: /sell RKLB 20 85.00")
-    except Exception as e:
-        logger.error(f"cmd_sell error: {e}")
-        await update.message.reply_text(f"❌ Error: {e}")
-
-
-async def cmd_portfolio(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/portfolio — show full live portfolio with P&L"""
-    try:
-        await update.message.reply_text("⏳ Fetching live prices...")
-        msg = _format_portfolio_summary()
-        await update.message.reply_text(msg, parse_mode="Markdown")
-    except Exception as e:
-        logger.error(f"cmd_portfolio error: {e}")
-        await update.message.reply_text(f"❌ Error: {e}")
-
-
-async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/help — show all available commands"""
-    msg = """
-🤖 *Trading Bot Commands*
-
-*Portfolio Management:*
-/buy TICKER SHARES PRICE → add position
-/sell TICKER SHARES PRICE → reduce position
-/portfolio → live P&L snapshot
-
-*Reminders:*
-/remind TICKER → analyze stock + offer reminder
-/remind TICKER BUY 190.00 → set price alert
-/remind TICKER SELL 220.00 2026-05-15 → price+date
-/reminders → see all active reminders
-/delreminder 1 → delete reminder #1
-
-*Manual Triggers:*
-/scan → Option Hunter + Swing Trades now
-/vix → current fear index
-
-*Settings:*
-/capital 3000 → update swing capital
-/setup → redo setup wizard
-/help → this message
-    """
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = (
+        "🤖 *Milnai Trading Bot v3.0*\n\n"
+        "*Portfolio Management:*\n"
+        "/add TICKER QTY PRICE [call|put STRIKE EXPIRY] — add position\n"
+        "/delete TICKER [type STRIKE EXPIRY] — remove position\n"
+        "/amend TICKER FIELD VALUE — edit a field\n"
+        "/portfolio — live P&L (stocks + options)\n\n"
+        "*Watchlist:*\n"
+        "/watchlist add|remove|view TICKER\n\n"
+        "*Scans & Signals:*\n"
+        "/scan — full scan now\n"
+        "/vix — fear index\n\n"
+        "*Reminders:*\n"
+        "/remind TICKER — analyze + set alert\n"
+        "/reminders | /delreminder N\n\n"
+        "*Settings:*\n"
+        "/capital AMOUNT\n"
+        "/help — all commands\n\n"
+        "📅 Auto alerts fire Mon–Fri during US market hours."
+    )
     await update.message.reply_text(msg, parse_mode="Markdown")
 
 
-async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/scan — manually trigger option hunter + swing scan"""
-    try:
-        await update.message.reply_text("🔍 Running scan... this takes ~1 min")
-        vix    = get_vix()
-        opps   = run_option_hunter(vix)
-        setups = run_swing_scanner(vix)
-        await update.message.reply_text(
-            format_option_hunter(opps, vix), parse_mode="Markdown"
-        )
-        await update.message.reply_text(
-            format_swing_trades(setups, vix), parse_mode="Markdown"
-        )
-    except Exception as e:
-        logger.error(f"cmd_scan error: {e}")
-        await update.message.reply_text(f"❌ Scan error: {e}")
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await cmd_start(update, context)
 
 
-async def cmd_vix(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/vix — check current VIX"""
-    try:
-        vix = get_vix()
-        if vix:
-            msg = f"{vix['emoji']} *VIX: {vix['level']:.2f}*\n{vix['sentiment']}"
-        else:
-            msg = "❌ Could not fetch VIX right now."
-        await update.message.reply_text(msg, parse_mode="Markdown")
-    except Exception as e:
-        await update.message.reply_text(f"❌ Error: {e}")
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("💬 Use commands. Type /help to see all.")
 
 
 # ============================================================================
@@ -2008,81 +2243,71 @@ def main():
         logger.error("❌ TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not set — exiting")
         return
 
-    # ── Scheduler (background thread) ────────────────────────────────────────
     scheduler = BackgroundScheduler(timezone=EST)
 
-    # Pre-market (6:30–9:30 AM ET)
-    scheduler.add_job(job_market_report, CronTrigger(
-        hour="6-9", minute=30, day_of_week="mon-fri"),
-        id="pre_market_report", name="Pre-Market Report")
+    # Pre-market: every 30min 6:30am–11:30am ET
+    scheduler.add_job(job_premarket_scan, CronTrigger(
+        hour="6-11", minute="0,30", day_of_week="mon-fri"),
+        id="premarket_scan", name="Pre-Market Scan (30min)")
 
-    # Option Hunter → then Swing Trades (2 separate messages)
-    scheduler.add_job(job_option_hunter, CronTrigger(
-        hour=8, minute=30, day_of_week="mon-fri"),
-        id="pre_market_options", name="Pre-Market Option Hunt + Swing")
-
-    # Earnings alert — 7am ET daily
-    scheduler.add_job(job_earnings_alert, CronTrigger(
-        hour=7, minute=0, day_of_week="mon-fri"),
-        id="earnings_alert", name="Earnings Alert")
-
-    # Market hours (9:30 AM – 3:30 PM ET)
+    # Market hours: every 60min 9:30am–3:30pm ET
     scheduler.add_job(job_market_report, CronTrigger(
         hour="9-15", minute=30, day_of_week="mon-fri"),
-        id="market_report", name="Market Hours Report")
+        id="market_report", name="Market Report (hourly)")
 
-    # Option Hunter → then Swing Trades at 10am, 12pm, 2pm
-    scheduler.add_job(job_option_hunter, CronTrigger(
-        hour="10,12,14", minute=0, day_of_week="mon-fri"),
-        id="market_options", name="Market Hours Option Hunt + Swing")
-
-    # Post-market (4:00–5:00 PM ET)
-    scheduler.add_job(job_trading_signals, CronTrigger(
-        hour="16-17", minute="0,30", day_of_week="mon-fri"),
-        id="post_signals", name="Post-Market Signals")
-
-    # Option Hunter → then Swing Trades at 4:15pm
-    scheduler.add_job(job_option_hunter, CronTrigger(
+    # EOD summary at 4:15pm ET
+    scheduler.add_job(job_eod_summary, CronTrigger(
         hour=16, minute=15, day_of_week="mon-fri"),
-        id="post_options", name="Post-Market Option Hunt + Swing")
+        id="eod_summary", name="EOD Summary")
+
+    # Post-market scan: every 30min 4:00pm–6:00pm ET
+    scheduler.add_job(job_postmarket_scan, CronTrigger(
+        hour="16-18", minute="0,30", day_of_week="mon-fri"),
+        id="postmarket_scan", name="Post-Market Scan (30min)")
 
     scheduler.start()
 
+    stock_count = len(get_stock_positions())
+    opt_count   = len(get_option_positions())
+
     logger.info("=" * 55)
-    logger.info("✅ Trading Bot v2.2 + Option Hunter + Swing Trader")
-    logger.info(f"   Scanning {len(OPTION_HUNT_TICKERS)} tickers for options")
-    logger.info(f"   Swing capital: ${SWING_CAPITAL:,} | Max trades: {SWING_MAX_TRADES}")
-    logger.info(f"   Watching {len(EARNINGS_CALENDAR)} stocks for earnings alerts")
-    logger.info(f"   Portfolio: {len(live_portfolio)} positions (live_portfolio)")
-    logger.info("   Commands: /buy /sell /portfolio /scan /vix /help")
+    logger.info("✅ Trading Bot v3.0 — Portfolio + Options + Watchlist")
+    logger.info(f"   Portfolio: {stock_count} stocks, {opt_count} options")
+    logger.info(f"   Watchlist: {len(live_watchlist)} tickers")
+    logger.info(f"   Option Hunt universe: {len(OPTION_HUNT_TICKERS)} tickers")
+    logger.info(f"   Swing capital: ${user_settings.get('swing_capital',2000):,}")
+    logger.info(f"   Signal confidence gate: {MIN_CONFIDENCE:.0%}")
+    logger.info(f"   Alert cooldown: {ALERT_COOLDOWN_MINUTES}min")
+    logger.info(f"   Watchlist cap: {WATCHLIST_MAX_PER_CYCLE}/cycle")
+    logger.info(f"   Finnhub news: {'✅ active' if FINNHUB_KEY else '⚠️ key missing'}")
     logger.info("=" * 55)
 
-    # ── Telegram Application (main thread — listens for commands) ─────────────
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    # Setup wizard
-    app.add_handler(CommandHandler("start",       cmd_start))
-    app.add_handler(CommandHandler("setup",       cmd_setup))
-    app.add_handler(CommandHandler("done",        cmd_done))
-    app.add_handler(CommandHandler("capital",     cmd_capital))
-
     # Portfolio management
-    app.add_handler(CommandHandler("buy",         cmd_buy))
-    app.add_handler(CommandHandler("sell",        cmd_sell))
-    app.add_handler(CommandHandler("portfolio",   cmd_portfolio))
+    app.add_handler(CommandHandler("add",          cmd_add))
+    app.add_handler(CommandHandler("delete",       cmd_delete))
+    app.add_handler(CommandHandler("amend",        cmd_amend))
+    app.add_handler(CommandHandler("portfolio",    cmd_portfolio))
+
+    # Watchlist
+    app.add_handler(CommandHandler("watchlist",    cmd_watchlist))
 
     # Reminders
-    app.add_handler(CommandHandler("remind",      cmd_remind))
-    app.add_handler(CommandHandler("reminders",   cmd_reminders))
-    app.add_handler(CommandHandler("delreminder", cmd_delreminder))
+    app.add_handler(CommandHandler("remind",       cmd_remind))
+    app.add_handler(CommandHandler("reminders",    cmd_reminders))
+    app.add_handler(CommandHandler("delreminder",  cmd_delreminder))
 
     # Scans & info
-    app.add_handler(CommandHandler("scan",        cmd_scan))
-    app.add_handler(CommandHandler("vix",         cmd_vix))
-    app.add_handler(CommandHandler("help",        cmd_help))
+    app.add_handler(CommandHandler("scan",         cmd_scan))
+    app.add_handler(CommandHandler("vix",          cmd_vix))
+    app.add_handler(CommandHandler("capital",      cmd_capital))
 
-    # Free text handler (wizard replies)
-    from telegram.ext import MessageHandler, filters
+    # Onboarding
+    app.add_handler(CommandHandler("start",        cmd_start))
+    app.add_handler(CommandHandler("help",         cmd_help))
+
+    # Free text
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     logger.info("🤖 Bot listening for commands...")
